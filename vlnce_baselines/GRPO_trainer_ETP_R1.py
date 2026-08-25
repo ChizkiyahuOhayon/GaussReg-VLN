@@ -287,12 +287,20 @@ class RLTrainer(BaseVLNCETrainer):
 
         try:
             vln_bert_module = self.policy.net.vln_bert
-            self.trainable_parts = [
-                vln_bert_module.global_encoder,
-                vln_bert_module.graph_query_text,
-                vln_bert_module.graph_attentioned_txt_embeds_transform,
-                vln_bert_module.global_sap_head
-            ]
+            if getattr(self.config.GRPO, 'gauss_only', False):
+                gauss_embedding = vln_bert_module.global_encoder.gmap_gauss_embedding
+                if gauss_embedding is None:
+                    raise ValueError(
+                        'GRPO.gauss_only requires MODEL.gauss_feat_size=5'
+                    )
+                self.trainable_parts = [gauss_embedding]
+            else:
+                self.trainable_parts = [
+                    vln_bert_module.global_encoder,
+                    vln_bert_module.graph_query_text,
+                    vln_bert_module.graph_attentioned_txt_embeds_transform,
+                    vln_bert_module.global_sap_head
+                ]
             for part in self.trainable_parts:
                 if not isinstance(part, torch.nn.Module):
                     raise TypeError(f"Part {part} is not an nn.Module")
@@ -310,6 +318,14 @@ class RLTrainer(BaseVLNCETrainer):
 
         not_trainable_parameters = [p for p in self.policy.parameters() if not p.requires_grad]
         trainable_parameters = [(n, p) for n, p in self.policy.named_parameters() if p.requires_grad]
+        if getattr(self.config.GRPO, 'gauss_only', False):
+            trainable_count = sum(p.numel() for _, p in trainable_parameters)
+            if len(trainable_parameters) != 1 or trainable_count != 3840:
+                raise RuntimeError(
+                    'Gaussian-only GRPO expected one 3,840-parameter tensor, got '
+                    '%d tensors and %d parameters' %
+                    (len(trainable_parameters), trainable_count)
+                )
         no_decay = ['bias', 'LayerNorm.bias', 'LayerNorm.weight']
         optimizer_grouped_parameters = [
             {'params': [p for n, p in trainable_parameters
@@ -388,6 +404,23 @@ class RLTrainer(BaseVLNCETrainer):
             else:
                 print("\nThere are no extra network layers in the weight file.")
             print("="*75 + "\n")
+
+            if getattr(self.config.GRPO, 'gauss_only', False):
+                invalid_missing = [
+                    key for key in incompatible_keys.missing_keys
+                    if not key.endswith('gmap_gauss_embedding.weight')
+                ]
+                if invalid_missing or incompatible_keys.unexpected_keys:
+                    raise RuntimeError(
+                        'E2 checkpoint mismatch: missing=%s, unexpected=%s' %
+                        (invalid_missing, incompatible_keys.unexpected_keys)
+                    )
+                gauss_weight = vln_bert_module.global_encoder.gmap_gauss_embedding.weight
+                if (incompatible_keys.missing_keys and
+                        torch.count_nonzero(gauss_weight).item() != 0):
+                    raise RuntimeError(
+                        'Missing Gaussian checkpoint weight must retain zero initialization'
+                    )
 
             if config.GRPO.is_requeue:
                 self.optimizer.load_state_dict(ckpt_dict["optim_state"])
@@ -925,7 +958,10 @@ class RLTrainer(BaseVLNCETrainer):
         self.gmaps = [GraphMap(have_real_pos, 
                                self.config.GRPO.loc_noise, 
                                self.config.MODEL.merge_ghost, 
-                               ghost_aug) for _ in range(self.envs.num_envs)]
+                               ghost_aug,
+                               gauss_feat_size=getattr(
+                                   self.config.MODEL, 'gauss_feat_size', 0
+                               )) for _ in range(self.envs.num_envs)]
         prev_vp = [None] * self.envs.num_envs
 
         for stepk in range(self.max_len): 

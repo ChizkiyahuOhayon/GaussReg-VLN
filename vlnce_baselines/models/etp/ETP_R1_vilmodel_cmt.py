@@ -567,10 +567,21 @@ class LocalVPEncoder(nn.Module):
 class GlobalMapEncoder(nn.Module):
     def __init__(self, config):
         super().__init__()
+        self.gauss_feat_size = getattr(config, 'gauss_feat_size', 0)
+        if self.gauss_feat_size not in (0, 5):
+            raise ValueError(
+                'gauss_feat_size must be 0 or 5, got %s' % self.gauss_feat_size
+            )
         self.gmap_pos_embeddings = nn.Sequential(
             nn.Linear(config.angle_feat_size + 3, config.hidden_size),
             BertLayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         )
+        self.gmap_gauss_embedding = None
+        if self.gauss_feat_size:
+            self.gmap_gauss_embedding = nn.Linear(
+                self.gauss_feat_size, config.hidden_size, bias=False
+            )
+            nn.init.zeros_(self.gmap_gauss_embedding.weight)
         self.gmap_step_embeddings = nn.Embedding(config.max_action_steps, config.hidden_size)
         self.gmap_task_embeddings = nn.Embedding(config.max_gmap_task_embeddings, config.hidden_size, padding_idx=0)
         self.encoder = CrossmodalEncoder(config)
@@ -581,6 +592,21 @@ class GlobalMapEncoder(nn.Module):
             self.sprel_linear = None
 
         self.task_embedding_dropout_prob = config.hidden_dropout_prob
+
+    def position_embedding(self, gmap_pos_fts):
+        pos_feat_size = self.gmap_pos_embeddings[0].in_features
+        expected_size = pos_feat_size + self.gauss_feat_size
+        if gmap_pos_fts.size(-1) != expected_size:
+            raise ValueError(
+                'Expected %d graph position features, got %d' %
+                (expected_size, gmap_pos_fts.size(-1))
+            )
+        pos_embeds = self.gmap_pos_embeddings(gmap_pos_fts[..., :pos_feat_size])
+        if self.gmap_gauss_embedding is not None:
+            pos_embeds = pos_embeds + self.gmap_gauss_embedding(
+                gmap_pos_fts[..., -self.gauss_feat_size:]
+            )
+        return pos_embeds
 
     def _aggregate_gmap_features(
         self, split_traj_embeds, split_traj_vp_lens, traj_vpids, traj_cand_vpids, gmap_vpids
@@ -634,7 +660,7 @@ class GlobalMapEncoder(nn.Module):
         gmap_embeds = gmap_img_fts + \
                       self.gmap_step_embeddings(gmap_step_ids) + \
                       task_type_encoding + \
-                      self.gmap_pos_embeddings(gmap_pos_fts)
+                      self.position_embedding(gmap_pos_fts)
         gmap_masks = gen_seq_masks(gmap_lens)
         return gmap_embeds, gmap_masks
 
@@ -718,6 +744,8 @@ class GlocalTextPathNavCMT(BertPreTrainedModel):
         self.global_sap_head = NextActionPrediction(config, self.config.hidden_size, self.config.pred_head_dropout_prob)
 
         self.init_weights()
+        if self.global_encoder.gmap_gauss_embedding is not None:
+            nn.init.zeros_(self.global_encoder.gmap_gauss_embedding.weight)
         
         if config.fix_lang_embedding:
             print("FIX LANG EMBEDDING!!!!!!!!!!!!!!!!!!!!!!!!")
@@ -786,7 +814,7 @@ class GlocalTextPathNavCMT(BertPreTrainedModel):
         gmap_embeds = gmap_img_fts + \
                       self.global_encoder.gmap_step_embeddings(gmap_step_ids) + \
                       task_type_encoding + \
-                      self.global_encoder.gmap_pos_embeddings(gmap_pos_fts)
+                      self.global_encoder.position_embedding(gmap_pos_fts)
 
         if self.global_encoder.sprel_linear is not None:
             graph_sprels = self.global_encoder.sprel_linear(

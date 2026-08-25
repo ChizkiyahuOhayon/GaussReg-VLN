@@ -136,7 +136,22 @@ class FloydGraph(object):
 
 
 class GraphMap(object):
-    def __init__(self, has_real_pos, loc_noise, merge_ghost, ghost_aug):
+    GAUSS_FEAT_SIZE = 5
+    GAUSS_MAX_OBS = 8.0
+    GAUSS_MAX_FRONTS = 4.0
+    GAUSS_MAX_STD = 3.0
+
+    def __init__(self, has_real_pos, loc_noise, merge_ghost, ghost_aug,
+                 gauss_feat_size=0):
+        if gauss_feat_size not in (0, self.GAUSS_FEAT_SIZE):
+            raise ValueError(
+                'gauss_feat_size must be 0 or %d, got %s' %
+                (self.GAUSS_FEAT_SIZE, gauss_feat_size)
+            )
+        if gauss_feat_size and loc_noise <= 0:
+            raise ValueError('loc_noise must be positive when Gaussian features are enabled')
+
+        self.gauss_feat_size = gauss_feat_size
 
         self.graph_nx = nx.Graph()
 
@@ -317,4 +332,36 @@ class GraphMap(object):
         rel_angles = np.array(rel_angles).astype(np.float32)
         rel_dists = np.array(rel_dists).astype(np.float32)
         rel_ang_fts = get_angle_fts(rel_angles[:, 0], rel_angles[:, 1], angle_feat_size=4)
-        return np.concatenate([rel_ang_fts, rel_dists], 1)
+        pos_fts = np.concatenate([rel_ang_fts, rel_dists], 1)
+        if self.gauss_feat_size:
+            pos_fts = np.concatenate([pos_fts, self.get_gauss_fts(gmap_vp_ids)], 1)
+        return pos_fts
+
+    def get_gauss_fts(self, gmap_vp_ids):
+        """Return uncertainty and support statistics for each graph-map token."""
+        gauss_fts = []
+        for vp in gmap_vp_ids:
+            if vp is None:
+                gauss_fts.append([0., 0., 0., 0., 0.])
+            elif vp.startswith('g'):
+                positions = np.asarray(self.ghost_pos[vp], dtype=np.float32)
+                std = np.minimum(
+                    positions.std(axis=0) / self.loc_noise,
+                    self.GAUSS_MAX_STD,
+                )
+                num_observations = min(len(positions), self.GAUSS_MAX_OBS)
+                num_fronts = min(
+                    len(set(self.ghost_fronts[vp])), self.GAUSS_MAX_FRONTS
+                )
+                gauss_fts.append([
+                    std[0], std[1], std[2],
+                    num_observations / self.GAUSS_MAX_OBS,
+                    num_fronts / self.GAUSS_MAX_FRONTS,
+                ])
+            else:
+                gauss_fts.append([
+                    0., 0., 0.,
+                    1. / self.GAUSS_MAX_OBS,
+                    1. / self.GAUSS_MAX_FRONTS,
+                ])
+        return np.asarray(gauss_fts, dtype=np.float32)

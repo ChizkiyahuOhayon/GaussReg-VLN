@@ -5,7 +5,15 @@
 
 [![arXiv](https://img.shields.io/badge/arXiv-2512.20940-b31b1b.svg)](https://arxiv.org/abs/2512.20940)
 
-This repository is the official implementation of the paper **"ETP-R1: Evolving Topological Planning with Reinforcement Fine-tuning for Vision-Language Navigation in Continuous Environments"**.
+This experimental fork is based on the official implementation of
+**"ETP-R1: Evolving Topological Planning with Reinforcement Fine-tuning for
+Vision-Language Navigation in Continuous Environments"**, fixed at upstream
+commit `a94b5c8fe20d1631e9e150c430a925543eb1cba9`. See [UPSTREAM.md](UPSTREAM.md)
+for provenance and the current redistribution caveat.
+
+The experimental E2 branch adds a zero-initialized, 3.8K-parameter Gaussian
+position residual while preserving the released policy at initialization. See
+[the E2 design and single-GPU commands](docs/e2_gaussian_residual.md).
 
 ## Introduction
 

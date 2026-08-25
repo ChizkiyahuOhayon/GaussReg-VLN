@@ -921,7 +921,10 @@ class RLTrainer(BaseVLNCETrainer):
         self.gmaps = [GraphMap(have_real_pos, 
                                self.config.IL.loc_noise, 
                                self.config.MODEL.merge_ghost, 
-                               ghost_aug) for _ in range(self.envs.num_envs)]
+                               ghost_aug,
+                               gauss_feat_size=getattr(
+                                   self.config.MODEL, 'gauss_feat_size', 0
+                               )) for _ in range(self.envs.num_envs)]
         prev_vp = [None] * self.envs.num_envs
 
         for stepk in range(self.max_len): 

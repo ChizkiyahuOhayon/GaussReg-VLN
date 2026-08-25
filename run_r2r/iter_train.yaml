@@ -97,6 +97,7 @@ GRPO:
   enable_amp: False
   enable_all_dropouts: False
   dropout_in_sampling: False
+  gauss_only: False
 
   T_start: 2.0
   T_end: 1.0
@@ -111,6 +112,7 @@ MODEL:
   fix_pano_embedding: False
   use_depth_embedding: True
   use_sprels: True
+  gauss_feat_size: 0
   merge_ghost: True
   consume_ghost: True
   
@@ -124,4 +126,3 @@ MODEL:
     directional: 128
   INSTRUCTION_ENCODER:
     bidirectional: True
-
