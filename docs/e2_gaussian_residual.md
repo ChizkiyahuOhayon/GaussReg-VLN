@@ -20,11 +20,13 @@ collection root when running the dependency-light E2 tests:
 
 ```bash
 python -m pytest -q --rootdir=tests --import-mode=importlib tests/test_e2_gaussian.py
+python tools/smoke_e2_model.py
 ```
 
-The tests cover baseline feature preservation, the zero-residual identity,
-released-checkpoint compatibility, the 3,840-parameter trainable set, and input
-shape validation.
+The dependency-light tests cover baseline feature preservation, the zero-residual
+identity, released-checkpoint compatibility, the 3,840-parameter trainable set,
+and input shape validation. The model smoke then instantiates the real pretrained
+ETP-R1 network and repeats the zero-output, freeze-boundary, and gradient checks.
 
 ## Single-GPU R2R-CE experiment
 
