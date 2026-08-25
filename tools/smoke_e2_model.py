@@ -37,7 +37,9 @@ def main():
     if gaussian is None or tuple(gaussian.weight.shape) != (768, 5):
         raise RuntimeError('Expected a bias-free Linear(5, 768) Gaussian residual')
     if torch.count_nonzero(gaussian.weight).item() != 0:
-        raise RuntimeError('Gaussian residual is not zero-initialized')
+        raise RuntimeError(
+            'Gaussian residual is not zero-initialized after from_pretrained'
+        )
 
     torch.manual_seed(0)
     position_features = torch.randn(2, 4, 12)

@@ -67,4 +67,14 @@ def get_vlnbert_models(config=None, dropout_rate=0.1):
         pretrained_model_name_or_path=None, 
         config=vis_config, 
         state_dict=new_ckpt_weights)
+    has_gaussian_weight = any(
+        key.endswith('global_encoder.gmap_gauss_embedding.weight')
+        for key in new_ckpt_weights
+    )
+    if (visual_model.global_encoder.gmap_gauss_embedding is not None and
+            not has_gaussian_weight):
+        # from_pretrained reinitializes missing keys after model.__init__.
+        torch.nn.init.zeros_(
+            visual_model.global_encoder.gmap_gauss_embedding.weight
+        )
     return visual_model
