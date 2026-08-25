@@ -32,6 +32,8 @@ def main():
             'Expected Gaussian weight shape %s, got %s' %
             (EXPECTED_SHAPE, tuple(weight.shape))
         )
+    if not torch.isfinite(weight).all().item():
+        raise RuntimeError('Gaussian residual contains NaN or Inf values')
 
     max_abs = weight.abs().max().item()
     l2_norm = weight.norm().item()
