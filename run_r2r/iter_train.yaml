@@ -113,6 +113,7 @@ MODEL:
   use_depth_embedding: True
   use_sprels: True
   gauss_feat_size: 0
+  gauss_residual_scale: 1.0
   merge_ghost: True
   consume_ghost: True
   

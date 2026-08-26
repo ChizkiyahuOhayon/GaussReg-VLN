@@ -41,6 +41,9 @@ def get_vlnbert_models(config=None, dropout_rate=0.1):
     vis_config.depth_feat_size = 128
     vis_config.angle_feat_size = 4
     vis_config.gauss_feat_size = getattr(config, 'gauss_feat_size', 0)
+    vis_config.gauss_residual_scale = getattr(
+        config, 'gauss_residual_scale', 1.0
+    )
 
     vis_config.num_l_layers = 12
     vis_config.num_pano_layers = 2

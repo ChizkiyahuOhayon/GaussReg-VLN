@@ -123,10 +123,11 @@ def _graph_map(module, gauss_feat_size):
     return graph
 
 
-def _encoder_config(gauss_feat_size):
+def _encoder_config(gauss_feat_size, gauss_residual_scale=1.0):
     return SimpleNamespace(
         angle_feat_size=4,
         gauss_feat_size=gauss_feat_size,
+        gauss_residual_scale=gauss_residual_scale,
         hidden_size=768,
         layer_norm_eps=1e-12,
         max_action_steps=100,
@@ -136,11 +137,13 @@ def _encoder_config(gauss_feat_size):
     )
 
 
-def _new_encoder(module, gauss_feat_size):
+def _new_encoder(module, gauss_feat_size, gauss_residual_scale=1.0):
     original_encoder = module.CrossmodalEncoder
     module.CrossmodalEncoder = lambda config: nn.Identity()
     try:
-        return module.GlobalMapEncoder(_encoder_config(gauss_feat_size))
+        return module.GlobalMapEncoder(
+            _encoder_config(gauss_feat_size, gauss_residual_scale)
+        )
     finally:
         module.CrossmodalEncoder = original_encoder
 
@@ -182,6 +185,35 @@ def test_zero_initialized_residual_is_an_exact_no_op(vilmodel):
 
     actual.sum().backward()
     assert torch.count_nonzero(encoder.gmap_gauss_embedding.weight.grad) > 0
+
+
+def test_gaussian_residual_scale_preserves_default_and_scales_residual(vilmodel):
+    default = _new_encoder(vilmodel, gauss_feat_size=5)
+    disabled = _new_encoder(
+        vilmodel, gauss_feat_size=5, gauss_residual_scale=0.0
+    )
+    scaled = _new_encoder(
+        vilmodel, gauss_feat_size=5, gauss_residual_scale=0.25
+    )
+    disabled.load_state_dict(default.state_dict())
+    scaled.load_state_dict(default.state_dict())
+    position_features = torch.randn(2, 4, 12)
+
+    with torch.no_grad():
+        default.gmap_gauss_embedding.weight.fill_(0.01)
+        disabled.gmap_gauss_embedding.weight.fill_(0.01)
+        scaled.gmap_gauss_embedding.weight.fill_(0.01)
+
+    base = default.gmap_pos_embeddings(position_features[..., :7])
+    residual = default.gmap_gauss_embedding(position_features[..., 7:])
+
+    assert torch.equal(
+        default.position_embedding(position_features), base + residual
+    )
+    assert torch.equal(
+        scaled.position_embedding(position_features), base + 0.25 * residual
+    )
+    assert torch.equal(disabled.position_embedding(position_features), base)
 
 
 def test_old_state_dict_leaves_only_zero_gaussian_weight_missing(vilmodel):

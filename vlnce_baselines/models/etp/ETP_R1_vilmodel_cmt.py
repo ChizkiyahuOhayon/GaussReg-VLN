@@ -568,6 +568,9 @@ class GlobalMapEncoder(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.gauss_feat_size = getattr(config, 'gauss_feat_size', 0)
+        self.gauss_residual_scale = getattr(
+            config, 'gauss_residual_scale', 1.0
+        )
         if self.gauss_feat_size not in (0, 5):
             raise ValueError(
                 'gauss_feat_size must be 0 or 5, got %s' % self.gauss_feat_size
@@ -603,8 +606,10 @@ class GlobalMapEncoder(nn.Module):
             )
         pos_embeds = self.gmap_pos_embeddings(gmap_pos_fts[..., :pos_feat_size])
         if self.gmap_gauss_embedding is not None:
-            pos_embeds = pos_embeds + self.gmap_gauss_embedding(
-                gmap_pos_fts[..., -self.gauss_feat_size:]
+            pos_embeds = pos_embeds + self.gauss_residual_scale * (
+                self.gmap_gauss_embedding(
+                    gmap_pos_fts[..., -self.gauss_feat_size:]
+                )
             )
         return pos_embeds
 

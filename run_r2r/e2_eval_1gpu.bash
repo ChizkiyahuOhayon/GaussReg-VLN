@@ -6,7 +6,7 @@ export MAGNUM_LOG=quiet
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-8}
 
 if [ "$#" -lt 1 ]; then
-    echo "Usage: $0 CHECKPOINT [EPISODE_COUNT] [NUM_ENVIRONMENTS] [PORT]" >&2
+    echo "Usage: $0 CHECKPOINT [EPISODE_COUNT] [NUM_ENVIRONMENTS] [PORT] [GAUSS_SCALE]" >&2
     exit 2
 fi
 
@@ -14,6 +14,8 @@ CKPT=$1
 EPISODES=${2:--1}
 NENV=${3:-4}
 PORT=${4:-2335}
+GAUSS_SCALE=${5:-1.0}
+SCALE_TAG=${GAUSS_SCALE//./p}
 PRETRAINED=${E2_PRETRAINED:-pretrained/r2r_rxr_ce/mlm.sap_habitat_depth/store2/model_step_367500.pt}
 
 if [ ! -f "${CKPT}" ]; then
@@ -25,9 +27,9 @@ if [ ! -f "${PRETRAINED}" ]; then
     exit 1
 fi
 
-echo "E2 evaluation | ${EPISODES} episode(s) | ${NENV} environment(s)"
+echo "E2 evaluation | scale ${GAUSS_SCALE} | ${EPISODES} episode(s) | ${NENV} environment(s)"
 python -m torch.distributed.launch --nproc_per_node=1 --master_port "${PORT}" run.py \
-    --exp_name e2_r2r_gaussian_residual \
+    --exp_name "e2_r2r_gaussian_residual_s${SCALE_TAG}" \
     --run-type eval \
     --exp-config run_r2r/iter_train.yaml \
     SIMULATOR_GPU_IDS "[0]" \
@@ -40,4 +42,5 @@ python -m torch.distributed.launch --nproc_per_node=1 --master_port "${PORT}" ru
     EVAL.CKPT_PATH_DIR "${CKPT}" \
     IL.back_algo control \
     MODEL.gauss_feat_size 5 \
+    MODEL.gauss_residual_scale "${GAUSS_SCALE}" \
     MODEL.pretrained_path "${PRETRAINED}"

@@ -55,5 +55,15 @@ CUDA_VISIBLE_DEVICES=0 bash run_r2r/e2_eval_1gpu.bash "$CKPT" 100 4 2335
 CUDA_VISIBLE_DEVICES=0 bash run_r2r/e2_eval_1gpu.bash "$CKPT" -1 4 2335
 ```
 
+The optional fifth argument scales the trained Gaussian residual without
+changing the checkpoint. The default is `1.0`; `0.0` exactly disables the
+residual. Scale diagnostics use separate experiment names so their result
+files do not overwrite one another:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 bash run_r2r/e2_eval_1gpu.bash "$CKPT" 100 4 2335 0.1
+CUDA_VISIBLE_DEVICES=0 bash run_r2r/e2_eval_1gpu.bash "$CKPT" 100 4 2336 0.25
+```
+
 Override `E2_BASE_CKPT` or `E2_PRETRAINED` only when the released assets are
 stored at different paths. The scripts never download data or checkpoints.
