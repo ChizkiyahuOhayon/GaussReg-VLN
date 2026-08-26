@@ -246,3 +246,63 @@ def test_position_feature_shape_mismatch_fails_fast(vilmodel):
 
     with pytest.raises(ValueError, match='Expected 12 graph position features'):
         encoder.position_embedding(torch.zeros(1, 3, 7))
+
+
+def _new_candidate_scorer(module):
+    config = SimpleNamespace(hidden_size=768, layer_norm_eps=1e-12)
+    scorer = module.CandidateResidualScorer(
+        config, position_size=12, hidden_size=256
+    )
+    scorer.reset_output()
+    return scorer
+
+
+def test_candidate_scorer_is_zero_initialized_lightweight_and_detached(vilmodel):
+    scorer = _new_candidate_scorer(vilmodel)
+    representations = torch.randn(2, 4, 1536, requires_grad=True)
+    positions = torch.randn(2, 4, 12)
+    visited = torch.tensor([
+        [False, True, False, False],
+        [False, False, True, False],
+    ])
+    baseline_logits = torch.randn(2, 4)
+
+    residual = scorer(representations, positions, visited)
+
+    assert torch.equal(residual, torch.zeros_like(residual))
+    assert torch.equal(baseline_logits + residual, baseline_logits)
+    assert sum(parameter.numel() for parameter in scorer.parameters()) == 400385
+
+    residual.sum().backward()
+    assert representations.grad is None
+    assert torch.count_nonzero(scorer.output.weight.grad) > 0
+
+
+def test_candidate_scorer_has_an_explicit_stop_indicator(vilmodel):
+    scorer = _new_candidate_scorer(vilmodel)
+    with torch.no_grad():
+        scorer.hidden.weight.zero_()
+        scorer.hidden.bias.zero_()
+        scorer.hidden.weight[0, -1] = 1.0
+        scorer.output.weight.zero_()
+        scorer.output.bias.zero_()
+        scorer.output.weight[0, 0] = 1.0
+
+    representations = torch.zeros(1, 3, 1536)
+    positions = torch.zeros(1, 3, 12)
+    visited = torch.zeros(1, 3, dtype=torch.bool)
+    residual = scorer(representations, positions, visited)
+
+    assert residual[0, 0] > 0
+    assert torch.equal(residual[0, 1:], torch.zeros(2))
+
+
+def test_candidate_scorer_rejects_misaligned_inputs(vilmodel):
+    scorer = _new_candidate_scorer(vilmodel)
+    representations = torch.zeros(1, 3, 1536)
+    visited = torch.zeros(1, 3, dtype=torch.bool)
+
+    with pytest.raises(ValueError, match='Expected 12 candidate position features'):
+        scorer(representations, torch.zeros(1, 3, 7), visited)
+    with pytest.raises(ValueError, match='visit mask are misaligned'):
+        scorer(representations, torch.zeros(1, 3, 12), visited[:, :2])

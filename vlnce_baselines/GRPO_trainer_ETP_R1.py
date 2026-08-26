@@ -287,7 +287,29 @@ class RLTrainer(BaseVLNCETrainer):
 
         try:
             vln_bert_module = self.policy.net.vln_bert
-            if getattr(self.config.GRPO, 'gauss_only', False):
+            gauss_only = getattr(self.config.GRPO, 'gauss_only', False)
+            scorer_only = getattr(
+                self.config.GRPO, 'candidate_scorer_only', False
+            )
+            if gauss_only and scorer_only:
+                raise ValueError(
+                    'gauss_only and candidate_scorer_only are mutually exclusive'
+                )
+            if scorer_only:
+                scorer = vln_bert_module.candidate_scorer
+                if scorer is None:
+                    raise ValueError(
+                        'candidate_scorer_only requires '
+                        'MODEL.candidate_scorer_hidden_size > 0'
+                    )
+                if (self.config.MODEL.gauss_feat_size != 5 or
+                        self.config.MODEL.gauss_residual_scale != 0.0):
+                    raise ValueError(
+                        'E3 requires gauss_feat_size=5 and '
+                        'gauss_residual_scale=0.0'
+                    )
+                self.trainable_parts = [scorer]
+            elif gauss_only:
                 gauss_embedding = vln_bert_module.global_encoder.gmap_gauss_embedding
                 if gauss_embedding is None:
                     raise ValueError(
@@ -325,6 +347,18 @@ class RLTrainer(BaseVLNCETrainer):
                     'Gaussian-only GRPO expected one 3,840-parameter tensor, got '
                     '%d tensors and %d parameters' %
                     (len(trainable_parameters), trainable_count)
+                )
+        if getattr(self.config.GRPO, 'candidate_scorer_only', False):
+            trainable_count = sum(p.numel() for _, p in trainable_parameters)
+            invalid_names = [
+                name for name, _ in trainable_parameters
+                if '.candidate_scorer.' not in name
+            ]
+            if invalid_names or trainable_count >= 500000:
+                raise RuntimeError(
+                    'Candidate-scorer GRPO expected only a sub-0.5M scorer, '
+                    'got invalid=%s and %d parameters' %
+                    (invalid_names, trainable_count)
                 )
         no_decay = ['bias', 'LayerNorm.bias', 'LayerNorm.weight']
         optimizer_grouped_parameters = [
@@ -421,6 +455,36 @@ class RLTrainer(BaseVLNCETrainer):
                     raise RuntimeError(
                         'Missing Gaussian checkpoint weight must retain zero initialization'
                     )
+            if getattr(self.config.GRPO, 'candidate_scorer_only', False):
+                invalid_missing = [
+                    key for key in incompatible_keys.missing_keys
+                    if (not key.endswith('gmap_gauss_embedding.weight') and
+                        '.candidate_scorer.' not in key)
+                ]
+                if invalid_missing or incompatible_keys.unexpected_keys:
+                    raise RuntimeError(
+                        'E3 checkpoint mismatch: missing=%s, unexpected=%s' %
+                        (invalid_missing, incompatible_keys.unexpected_keys)
+                    )
+                scorer_missing = [
+                    key for key in incompatible_keys.missing_keys
+                    if '.candidate_scorer.' in key
+                ]
+                if scorer_missing:
+                    missing_names = {
+                        key.split('.candidate_scorer.', 1)[1]
+                        for key in scorer_missing
+                    }
+                    expected_names = {
+                        name for name, _ in
+                        vln_bert_module.candidate_scorer.named_parameters()
+                    }
+                    if missing_names != expected_names:
+                        raise RuntimeError(
+                            'E3 checkpoint has a partial candidate scorer: %s' %
+                            sorted(missing_names)
+                        )
+                    vln_bert_module.candidate_scorer.reset_output()
 
             if config.GRPO.is_requeue:
                 self.optimizer.load_state_dict(ckpt_dict["optim_state"])

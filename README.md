@@ -15,6 +15,10 @@ The experimental E2 branch adds a zero-initialized, 3.8K-parameter Gaussian
 position residual while preserving the released policy at initialization. See
 [the E2 design and single-GPU commands](docs/e2_gaussian_residual.md).
 
+The E3 experiment keeps the backbone frozen and learns a sub-0.5M shared
+candidate/STOP residual scorer. See
+[the E3 design and single-GPU commands](docs/e3_candidate_scorer.md).
+
 ## Introduction
 
 Vision-Language Navigation in Continuous Environments (VLN-CE) requires an embodied agent to navigate towards target in continuous environments, following natural language instructions. While current graph-based methods offer an efficient, structured approach by abstracting the environment into a topological map and simplifying the action space to waypoint selection, they lag behind methods based on Large Vision-Language Models (LVLMs) in leveraging large-scale data and advanced training paradigms.

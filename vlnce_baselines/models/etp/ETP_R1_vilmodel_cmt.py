@@ -736,6 +736,46 @@ class NextActionPrediction(nn.Module):
     def forward(self, x):
         return self.net(x)
 
+
+class CandidateResidualScorer(nn.Module):
+    """Score graph candidates without back-propagating into the VLN backbone."""
+
+    def __init__(self, config, position_size, hidden_size):
+        super().__init__()
+        representation_size = config.hidden_size * 2
+        input_size = representation_size + position_size + 2
+        self.position_size = position_size
+        self.representation_norm = BertLayerNorm(
+            representation_size, eps=config.layer_norm_eps
+        )
+        self.hidden = nn.Linear(input_size, hidden_size)
+        self.output = nn.Linear(hidden_size, 1)
+
+    def reset_output(self):
+        nn.init.zeros_(self.output.weight)
+        nn.init.zeros_(self.output.bias)
+
+    def forward(self, representations, position_features, visited_mask):
+        if position_features.size(-1) != self.position_size:
+            raise ValueError(
+                'Expected %d candidate position features, got %d' %
+                (self.position_size, position_features.size(-1))
+            )
+        if representations.shape[:2] != position_features.shape[:2]:
+            raise ValueError('Candidate representations and features are misaligned')
+        if representations.shape[:2] != visited_mask.shape:
+            raise ValueError('Candidate representations and visit mask are misaligned')
+
+        representations = self.representation_norm(representations.detach())
+        position_features = position_features.to(dtype=representations.dtype)
+        visited = visited_mask.unsqueeze(-1).to(dtype=representations.dtype)
+        stop = torch.zeros_like(visited)
+        stop[:, 0] = 1
+        inputs = torch.cat(
+            [representations, position_features, visited, stop], dim=-1
+        )
+        return torch.tanh(self.output(gelu(self.hidden(inputs)))).squeeze(-1)
+
 class GlocalTextPathNavCMT(BertPreTrainedModel): 
     def __init__(self, config):
         super().__init__(config)
@@ -747,10 +787,20 @@ class GlocalTextPathNavCMT(BertPreTrainedModel):
         self.graph_query_text = BertOutAttention(config)
         self.graph_attentioned_txt_embeds_transform = ResidualTransformBlock(config, self.config.hidden_size, self.config.hidden_dropout_prob)
         self.global_sap_head = NextActionPrediction(config, self.config.hidden_size, self.config.pred_head_dropout_prob)
+        scorer_hidden_size = getattr(config, 'candidate_scorer_hidden_size', 0)
+        if scorer_hidden_size > 0:
+            position_size = 7 + getattr(config, 'gauss_feat_size', 0)
+            self.candidate_scorer = CandidateResidualScorer(
+                config, position_size, scorer_hidden_size
+            )
+        else:
+            self.candidate_scorer = None
 
         self.init_weights()
         if self.global_encoder.gmap_gauss_embedding is not None:
             nn.init.zeros_(self.global_encoder.gmap_gauss_embedding.weight)
+        if self.candidate_scorer is not None:
+            self.candidate_scorer.reset_output()
         
         if config.fix_lang_embedding:
             print("FIX LANG EMBEDDING!!!!!!!!!!!!!!!!!!!!!!!!")
@@ -838,6 +888,10 @@ class GlocalTextPathNavCMT(BertPreTrainedModel):
         graph_attentioned_txt_embeds = self.graph_attentioned_txt_embeds_transform(graph_attentioned_txt_embeds)
         fusion_input = torch.cat([gmap_embeds, graph_attentioned_txt_embeds], dim=-1)
         global_logits = self.global_sap_head(fusion_input).squeeze(2)
+        if self.candidate_scorer is not None:
+            global_logits = global_logits + self.candidate_scorer(
+                fusion_input, gmap_pos_fts, gmap_visited_masks
+            )
         global_logits.masked_fill_(gmap_visited_masks, -float('inf'))
         global_logits.masked_fill_(gmap_masks.logical_not(), -float('inf'))
 
