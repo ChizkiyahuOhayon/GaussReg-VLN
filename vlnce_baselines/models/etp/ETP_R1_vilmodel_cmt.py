@@ -745,6 +745,7 @@ class CandidateResidualScorer(nn.Module):
         representation_size = config.hidden_size * 2
         input_size = representation_size + position_size + 2
         self.position_size = position_size
+        self.scale = getattr(config, 'candidate_scorer_scale', 1.0)
         self.representation_norm = BertLayerNorm(
             representation_size, eps=config.layer_norm_eps
         )
@@ -774,7 +775,8 @@ class CandidateResidualScorer(nn.Module):
         inputs = torch.cat(
             [representations, position_features, visited, stop], dim=-1
         )
-        return torch.tanh(self.output(gelu(self.hidden(inputs)))).squeeze(-1)
+        residual = torch.tanh(self.output(gelu(self.hidden(inputs)))).squeeze(-1)
+        return self.scale * residual
 
 class GlocalTextPathNavCMT(BertPreTrainedModel): 
     def __init__(self, config):

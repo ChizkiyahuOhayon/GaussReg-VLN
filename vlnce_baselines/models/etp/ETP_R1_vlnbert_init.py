@@ -47,6 +47,9 @@ def get_vlnbert_models(config=None, dropout_rate=0.1):
     vis_config.candidate_scorer_hidden_size = getattr(
         config, 'candidate_scorer_hidden_size', 0
     )
+    vis_config.candidate_scorer_scale = getattr(
+        config, 'candidate_scorer_scale', 1.0
+    )
 
     vis_config.num_l_layers = 12
     vis_config.num_pano_layers = 2

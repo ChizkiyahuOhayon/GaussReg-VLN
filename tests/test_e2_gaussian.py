@@ -248,8 +248,12 @@ def test_position_feature_shape_mismatch_fails_fast(vilmodel):
         encoder.position_embedding(torch.zeros(1, 3, 7))
 
 
-def _new_candidate_scorer(module):
-    config = SimpleNamespace(hidden_size=768, layer_norm_eps=1e-12)
+def _new_candidate_scorer(module, scale=1.0):
+    config = SimpleNamespace(
+        hidden_size=768,
+        layer_norm_eps=1e-12,
+        candidate_scorer_scale=scale,
+    )
     scorer = module.CandidateResidualScorer(
         config, position_size=12, hidden_size=256
     )
@@ -295,6 +299,21 @@ def test_candidate_scorer_has_an_explicit_stop_indicator(vilmodel):
 
     assert residual[0, 0] > 0
     assert torch.equal(residual[0, 1:], torch.zeros(2))
+
+
+def test_candidate_scorer_scale_zero_restores_baseline(vilmodel):
+    scorer = _new_candidate_scorer(vilmodel, scale=0.0)
+    with torch.no_grad():
+        scorer.output.weight.fill_(1.0)
+        scorer.output.bias.fill_(1.0)
+
+    residual = scorer(
+        torch.randn(1, 3, 1536),
+        torch.randn(1, 3, 12),
+        torch.zeros(1, 3, dtype=torch.bool),
+    )
+
+    assert torch.equal(residual, torch.zeros_like(residual))
 
 
 def test_candidate_scorer_rejects_misaligned_inputs(vilmodel):

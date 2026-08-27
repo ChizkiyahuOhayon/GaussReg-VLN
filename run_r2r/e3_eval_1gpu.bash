@@ -6,7 +6,7 @@ export MAGNUM_LOG=quiet
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-8}
 
 if [ "$#" -lt 1 ]; then
-    echo "Usage: $0 CHECKPOINT [EPISODE_COUNT] [NUM_ENVIRONMENTS] [PORT]" >&2
+    echo "Usage: $0 CHECKPOINT [EPISODE_COUNT] [NUM_ENVIRONMENTS] [PORT] [SCORER_SCALE]" >&2
     exit 2
 fi
 
@@ -14,6 +14,7 @@ CKPT=$1
 EPISODES=${2:--1}
 NENV=${3:-4}
 PORT=${4:-2335}
+SCORER_SCALE=${5:-1.0}
 PRETRAINED=${E3_PRETRAINED:-pretrained/r2r_rxr_ce/mlm.sap_habitat_depth/store2/model_step_367500.pt}
 
 if [ ! -f "${CKPT}" ]; then
@@ -25,7 +26,7 @@ if [ ! -f "${PRETRAINED}" ]; then
     exit 1
 fi
 
-echo "E3 evaluation | ${EPISODES} episode(s) | ${NENV} environment(s)"
+echo "E3 evaluation | scale ${SCORER_SCALE} | ${EPISODES} episode(s) | ${NENV} environment(s)"
 python -m torch.distributed.launch --nproc_per_node=1 --master_port "${PORT}" run.py \
     --exp_name e3_r2r_candidate_scorer \
     --run-type eval \
@@ -42,4 +43,5 @@ python -m torch.distributed.launch --nproc_per_node=1 --master_port "${PORT}" ru
     MODEL.gauss_feat_size 5 \
     MODEL.gauss_residual_scale 0.0 \
     MODEL.candidate_scorer_hidden_size 256 \
+    MODEL.candidate_scorer_scale "${SCORER_SCALE}" \
     MODEL.pretrained_path "${PRETRAINED}"

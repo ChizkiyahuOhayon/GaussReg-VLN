@@ -116,6 +116,7 @@ MODEL:
   gauss_feat_size: 0
   gauss_residual_scale: 1.0
   candidate_scorer_hidden_size: 0
+  candidate_scorer_scale: 1.0
   merge_ghost: True
   consume_ghost: True
   
