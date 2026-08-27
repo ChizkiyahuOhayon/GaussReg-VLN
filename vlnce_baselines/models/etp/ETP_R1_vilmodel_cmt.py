@@ -778,6 +778,171 @@ class CandidateResidualScorer(nn.Module):
         residual = torch.tanh(self.output(gelu(self.hidden(inputs)))).squeeze(-1)
         return self.scale * residual
 
+
+class GaussianBEVResidual(nn.Module):
+    """Mix detached graph candidates in a small egocentric Gaussian field."""
+
+    SIN_HEADING = 0
+    COS_HEADING = 1
+    COS_ELEVATION = 3
+    REL_DISTANCE = 4
+    STD_X = 7
+    STD_Z = 9
+    OBSERVATION_SUPPORT = 10
+
+    def __init__(
+        self, representation_size, position_size, hidden_size, grid_size=21,
+        extent=10.0, max_distance=30.0, location_noise=0.5,
+    ):
+        super().__init__()
+        if grid_size < 3 or grid_size % 2 == 0:
+            raise ValueError('Gaussian BEV grid_size must be odd and at least 3')
+        if position_size != 12:
+            raise ValueError('Gaussian BEV requires 12 graph position features')
+        if extent <= 0 or max_distance <= 0 or location_noise <= 0:
+            raise ValueError('Gaussian BEV metric scales must be positive')
+
+        self.position_size = position_size
+        self.grid_size = grid_size
+        self.extent = extent
+        self.max_distance = max_distance
+        self.location_noise = location_noise
+        self.min_sigma = extent / (grid_size - 1)
+
+        coordinates = torch.linspace(-extent, extent, grid_size)
+        grid_x = coordinates.view(1, -1).expand(grid_size, grid_size)
+        grid_z = coordinates.view(-1, 1).expand(grid_size, grid_size)
+        self.register_buffer('grid_x', grid_x, persistent=False)
+        self.register_buffer('grid_z', grid_z, persistent=False)
+
+        self.projection = nn.Linear(
+            representation_size, hidden_size, bias=False
+        )
+        field_size = hidden_size + 3
+        self.depthwise = nn.Conv2d(
+            field_size, field_size, 3, padding=1,
+            groups=field_size, bias=False,
+        )
+        self.pointwise = nn.Conv2d(
+            field_size, hidden_size, 1, bias=False
+        )
+        self.output = nn.Linear(hidden_size, 1, bias=False)
+
+    def reset_output(self):
+        nn.init.zeros_(self.output.weight)
+
+    def _candidate_geometry(self, position_features):
+        distance = (
+            position_features[..., self.REL_DISTANCE] * self.max_distance
+        )
+        horizontal_distance = (
+            distance * position_features[..., self.COS_ELEVATION]
+        )
+        x = -horizontal_distance * position_features[..., self.SIN_HEADING]
+        z = -horizontal_distance * position_features[..., self.COS_HEADING]
+        metric_std_x = (
+            position_features[..., self.STD_X] * self.location_noise
+        )
+        metric_std_z = (
+            position_features[..., self.STD_Z] * self.location_noise
+        )
+        # World-axis diagonal std has no orientation in gmap_pos_fts. Its
+        # radial magnitude is therefore the coordinate-safe BEV uncertainty.
+        sigma = torch.sqrt(metric_std_x.square() + metric_std_z.square())
+        sigma = sigma.clamp_min(self.min_sigma)
+        return x, z, sigma
+
+    def _gaussian_weights(self, position_features, valid_mask):
+        if position_features.size(-1) != self.position_size:
+            raise ValueError(
+                'Expected %d Gaussian BEV position features, got %d' %
+                (self.position_size, position_features.size(-1))
+            )
+        if position_features.shape[:2] != valid_mask.shape:
+            raise ValueError('Gaussian BEV positions and masks are misaligned')
+
+        x, z, sigma = self._candidate_geometry(position_features)
+        spatial_mask = valid_mask.clone()
+        spatial_mask[:, 0] = False
+        spatial_mask &= x.abs() <= self.extent
+        spatial_mask &= z.abs() <= self.extent
+
+        dx = self.grid_x - x.unsqueeze(-1).unsqueeze(-1)
+        dz = self.grid_z - z.unsqueeze(-1).unsqueeze(-1)
+        variance = sigma.square().unsqueeze(-1).unsqueeze(-1)
+        weights = torch.exp(-0.5 * (dx.square() + dz.square()) / variance)
+        weights = weights * spatial_mask.unsqueeze(-1).unsqueeze(-1).to(
+            dtype=weights.dtype
+        )
+        return weights, spatial_mask
+
+    def _build_field(
+        self, representations, position_features, valid_mask, visited_mask
+    ):
+        weights, spatial_mask = self._gaussian_weights(
+            position_features, valid_mask
+        )
+        projected = self.projection(representations.detach())
+        mass = weights.sum(dim=1, keepdim=True)
+        feature_sum = torch.einsum(
+            'bnhw,bnd->bdhw', weights, projected
+        )
+        features = feature_sum / mass.clamp_min(1e-6)
+
+        unvisited = visited_mask.logical_not().to(dtype=weights.dtype)
+        unvisited_mass = (
+            weights * unvisited.unsqueeze(-1).unsqueeze(-1)
+        ).sum(dim=1, keepdim=True)
+        support = position_features[..., self.OBSERVATION_SUPPORT].to(
+            dtype=weights.dtype
+        )
+        support_mass = (
+            weights * support.unsqueeze(-1).unsqueeze(-1)
+        ).sum(dim=1, keepdim=True)
+        scalars = torch.cat([
+            mass / (mass + 1.0),
+            unvisited_mass / mass.clamp_min(1e-6),
+            support_mass / mass.clamp_min(1e-6),
+        ], dim=1)
+        return torch.cat([features, scalars], dim=1), mass, spatial_mask
+
+    def forward(
+        self, representations, position_features, valid_mask, visited_mask
+    ):
+        if representations.shape[:2] != position_features.shape[:2]:
+            raise ValueError('Gaussian BEV representations and positions are misaligned')
+        if visited_mask.shape != valid_mask.shape:
+            raise ValueError('Gaussian BEV visit and valid masks are misaligned')
+
+        position_features = position_features.to(dtype=representations.dtype)
+        field, mass, spatial_mask = self._build_field(
+            representations, position_features, valid_mask, visited_mask
+        )
+        mixed = gelu(self.pointwise(self.depthwise(field)))
+
+        x, z, _ = self._candidate_geometry(position_features)
+        query_grid = torch.stack([
+            x / self.extent, z / self.extent
+        ], dim=-1).unsqueeze(2)
+        candidate_context = F.grid_sample(
+            mixed, query_grid, mode='bilinear', padding_mode='zeros',
+            align_corners=True,
+        ).squeeze(3).transpose(1, 2)
+        candidate_context = candidate_context * spatial_mask.unsqueeze(-1).to(
+            dtype=candidate_context.dtype
+        )
+
+        occupied = (mass > 1e-4).to(dtype=mixed.dtype)
+        stop_context = (mixed * occupied).sum(dim=(2, 3))
+        stop_context = stop_context / occupied.sum(dim=(2, 3)).clamp_min(1.0)
+        contexts = candidate_context.clone()
+        contexts[:, 0] = stop_context
+
+        residual = self.output(torch.tanh(contexts)).squeeze(-1)
+        output_mask = spatial_mask.clone()
+        output_mask[:, 0] = valid_mask[:, 0]
+        return residual * output_mask.to(dtype=residual.dtype)
+
 class GlocalTextPathNavCMT(BertPreTrainedModel): 
     def __init__(self, config):
         super().__init__(config)
@@ -797,12 +962,30 @@ class GlocalTextPathNavCMT(BertPreTrainedModel):
             )
         else:
             self.candidate_scorer = None
+        gaussian_bev_hidden_size = getattr(
+            config, 'gaussian_bev_hidden_size', 0
+        )
+        if gaussian_bev_hidden_size > 0:
+            if self.candidate_scorer is not None:
+                raise ValueError(
+                    'candidate_scorer and gaussian_bev are mutually exclusive'
+                )
+            position_size = 7 + getattr(config, 'gauss_feat_size', 0)
+            self.gaussian_bev = GaussianBEVResidual(
+                representation_size=config.hidden_size * 2,
+                position_size=position_size,
+                hidden_size=gaussian_bev_hidden_size,
+            )
+        else:
+            self.gaussian_bev = None
 
         self.init_weights()
         if self.global_encoder.gmap_gauss_embedding is not None:
             nn.init.zeros_(self.global_encoder.gmap_gauss_embedding.weight)
         if self.candidate_scorer is not None:
             self.candidate_scorer.reset_output()
+        if self.gaussian_bev is not None:
+            self.gaussian_bev.reset_output()
         
         if config.fix_lang_embedding:
             print("FIX LANG EMBEDDING!!!!!!!!!!!!!!!!!!!!!!!!")
@@ -893,6 +1076,11 @@ class GlocalTextPathNavCMT(BertPreTrainedModel):
         if self.candidate_scorer is not None:
             global_logits = global_logits + self.candidate_scorer(
                 fusion_input, gmap_pos_fts, gmap_visited_masks
+            )
+        if self.gaussian_bev is not None:
+            global_logits = global_logits + self.gaussian_bev(
+                fusion_input, gmap_pos_fts, gmap_masks,
+                gmap_visited_masks,
             )
         global_logits.masked_fill_(gmap_visited_masks, -float('inf'))
         global_logits.masked_fill_(gmap_masks.logical_not(), -float('inf'))

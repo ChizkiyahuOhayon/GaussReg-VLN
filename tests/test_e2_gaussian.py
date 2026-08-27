@@ -325,3 +325,121 @@ def test_candidate_scorer_rejects_misaligned_inputs(vilmodel):
         scorer(representations, torch.zeros(1, 3, 7), visited)
     with pytest.raises(ValueError, match='visit mask are misaligned'):
         scorer(representations, torch.zeros(1, 3, 12), visited[:, :2])
+
+
+def _new_gaussian_bev(module):
+    field = module.GaussianBEVResidual(
+        representation_size=1536,
+        position_size=12,
+        hidden_size=32,
+        grid_size=21,
+        extent=10.0,
+        max_distance=30.0,
+        location_noise=0.5,
+    )
+    field.reset_output()
+    return field
+
+
+def _gaussian_bev_inputs(batch_size=2):
+    representations = torch.randn(batch_size, 4, 1536, requires_grad=True)
+    positions = torch.zeros(batch_size, 4, 12)
+    positions[:, :, 1] = 1.0
+    positions[:, :, 3] = 1.0
+    positions[:, 1:, 4] = torch.tensor([0.1, 0.2, 0.3])
+    positions[:, 1:, 7] = 0.2
+    positions[:, 1:, 9] = 0.4
+    positions[:, 1:, 10] = 0.5
+    masks = torch.ones(batch_size, 4, dtype=torch.bool)
+    visited = torch.zeros(batch_size, 4, dtype=torch.bool)
+    visited[:, 1] = True
+    return representations, positions, masks, visited
+
+
+def test_gaussian_bev_is_zero_initialized_lightweight_and_detached(vilmodel):
+    field = _new_gaussian_bev(vilmodel)
+    representations, positions, masks, visited = _gaussian_bev_inputs()
+    baseline_logits = torch.randn(2, 4)
+
+    residual = field(representations, positions, masks, visited)
+
+    assert residual.shape == baseline_logits.shape
+    assert torch.equal(residual, torch.zeros_like(residual))
+    assert torch.equal(baseline_logits + residual, baseline_logits)
+    assert sum(parameter.numel() for parameter in field.parameters()) < 100000
+
+    residual.sum().backward()
+    assert representations.grad is None
+    assert torch.count_nonzero(field.output.weight.grad) > 0
+
+
+def test_gaussian_bev_excludes_stop_padding_and_out_of_range_tokens(vilmodel):
+    field = _new_gaussian_bev(vilmodel)
+    _, positions, masks, _ = _gaussian_bev_inputs(batch_size=1)
+    masks[0, 3] = False
+    positions[0, 2, 4] = 1.0
+
+    weights, spatial_mask = field._gaussian_weights(positions, masks)
+
+    assert torch.count_nonzero(weights[:, 0]) == 0
+    assert torch.count_nonzero(weights[:, 2]) == 0
+    assert torch.count_nonzero(weights[:, 3]) == 0
+    assert not spatial_mask[0, 0]
+    assert not spatial_mask[0, 2]
+    assert not spatial_mask[0, 3]
+
+
+def test_gaussian_bev_padding_and_batches_are_isolated(vilmodel):
+    torch.manual_seed(0)
+    field = _new_gaussian_bev(vilmodel)
+    with torch.no_grad():
+        field.output.weight.fill_(1.0)
+    representations, positions, masks, visited = _gaussian_bev_inputs()
+    masks[:, 3] = False
+
+    expected = field(representations, positions, masks, visited)
+    changed = representations.detach().clone()
+    changed[0, 3].fill_(1e4)
+    changed[1, 3].fill_(-1e4)
+    actual = field(changed, positions, masks, visited)
+
+    assert torch.equal(actual, expected)
+    assert torch.allclose(actual[0], field(
+        changed[:1], positions[:1], masks[:1], visited[:1]
+    )[0])
+    assert torch.allclose(actual[1], field(
+        changed[1:], positions[1:], masks[1:], visited[1:]
+    )[0])
+
+
+def test_gaussian_bev_uncertainty_controls_spatial_support(vilmodel):
+    field = _new_gaussian_bev(vilmodel)
+    _, positions, masks, _ = _gaussian_bev_inputs(batch_size=1)
+    masks[:, 2:] = False
+    positions[0, 1, 4] = 0.0
+
+    positions[0, 1, 7] = 0.0
+    positions[0, 1, 9] = 0.0
+    narrow, _ = field._gaussian_weights(positions, masks)
+    positions[0, 1, 7] = 3.0
+    positions[0, 1, 9] = 3.0
+    wide, _ = field._gaussian_weights(positions, masks)
+
+    center = field.grid_size // 2
+    assert wide[0, 1, center, center + 2] > narrow[0, 1, center, center + 2]
+    assert wide[0, 1].sum() > narrow[0, 1].sum()
+
+
+def test_gaussian_bev_out_of_range_candidate_falls_back_to_e0(vilmodel):
+    field = _new_gaussian_bev(vilmodel)
+    with torch.no_grad():
+        field.output.weight.fill_(1.0)
+    representations, positions, masks, visited = _gaussian_bev_inputs(
+        batch_size=1
+    )
+    positions[0, 2, 4] = 1.0
+
+    residual = field(representations, positions, masks, visited)
+
+    assert residual.dtype == representations.dtype
+    assert residual[0, 2].item() == 0.0

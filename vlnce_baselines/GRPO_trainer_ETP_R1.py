@@ -291,11 +291,29 @@ class RLTrainer(BaseVLNCETrainer):
             scorer_only = getattr(
                 self.config.GRPO, 'candidate_scorer_only', False
             )
-            if gauss_only and scorer_only:
+            gaussian_bev_only = getattr(
+                self.config.GRPO, 'gaussian_bev_only', False
+            )
+            if sum([gauss_only, scorer_only, gaussian_bev_only]) > 1:
                 raise ValueError(
-                    'gauss_only and candidate_scorer_only are mutually exclusive'
+                    'GRPO lightweight-only modes are mutually exclusive'
                 )
-            if scorer_only:
+            if gaussian_bev_only:
+                gaussian_bev = vln_bert_module.gaussian_bev
+                if gaussian_bev is None:
+                    raise ValueError(
+                        'gaussian_bev_only requires '
+                        'MODEL.gaussian_bev_hidden_size > 0'
+                    )
+                if (self.config.MODEL.gauss_feat_size != 5 or
+                        self.config.MODEL.gauss_residual_scale != 0.0 or
+                        self.config.MODEL.candidate_scorer_hidden_size != 0):
+                    raise ValueError(
+                        'E4 requires gauss_feat_size=5, '
+                        'gauss_residual_scale=0.0, and no candidate scorer'
+                    )
+                self.trainable_parts = [gaussian_bev]
+            elif scorer_only:
                 scorer = vln_bert_module.candidate_scorer
                 if scorer is None:
                     raise ValueError(
@@ -357,6 +375,18 @@ class RLTrainer(BaseVLNCETrainer):
             if invalid_names or trainable_count >= 500000:
                 raise RuntimeError(
                     'Candidate-scorer GRPO expected only a sub-0.5M scorer, '
+                    'got invalid=%s and %d parameters' %
+                    (invalid_names, trainable_count)
+                )
+        if getattr(self.config.GRPO, 'gaussian_bev_only', False):
+            trainable_count = sum(p.numel() for _, p in trainable_parameters)
+            invalid_names = [
+                name for name, _ in trainable_parameters
+                if '.gaussian_bev.' not in name
+            ]
+            if invalid_names or trainable_count >= 100000:
+                raise RuntimeError(
+                    'Gaussian-BEV GRPO expected only a sub-0.1M field, '
                     'got invalid=%s and %d parameters' %
                     (invalid_names, trainable_count)
                 )
@@ -485,6 +515,36 @@ class RLTrainer(BaseVLNCETrainer):
                             sorted(missing_names)
                         )
                     vln_bert_module.candidate_scorer.reset_output()
+            if getattr(self.config.GRPO, 'gaussian_bev_only', False):
+                invalid_missing = [
+                    key for key in incompatible_keys.missing_keys
+                    if (not key.endswith('gmap_gauss_embedding.weight') and
+                        '.gaussian_bev.' not in key)
+                ]
+                if invalid_missing or incompatible_keys.unexpected_keys:
+                    raise RuntimeError(
+                        'E4 checkpoint mismatch: missing=%s, unexpected=%s' %
+                        (invalid_missing, incompatible_keys.unexpected_keys)
+                    )
+                bev_missing = [
+                    key for key in incompatible_keys.missing_keys
+                    if '.gaussian_bev.' in key
+                ]
+                if bev_missing:
+                    missing_names = {
+                        key.split('.gaussian_bev.', 1)[1]
+                        for key in bev_missing
+                    }
+                    expected_names = {
+                        name for name, _ in
+                        vln_bert_module.gaussian_bev.named_parameters()
+                    }
+                    if missing_names != expected_names:
+                        raise RuntimeError(
+                            'E4 checkpoint has a partial Gaussian BEV: %s' %
+                            sorted(missing_names)
+                        )
+                    vln_bert_module.gaussian_bev.reset_output()
 
             if config.GRPO.is_requeue:
                 self.optimizer.load_state_dict(ckpt_dict["optim_state"])
