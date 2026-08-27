@@ -406,10 +406,10 @@ def test_gaussian_bev_padding_and_batches_are_isolated(vilmodel):
     assert torch.equal(actual, expected)
     assert torch.allclose(actual[0], field(
         changed[:1], positions[:1], masks[:1], visited[:1]
-    )[0])
+    )[0], atol=1e-6, rtol=1e-6)
     assert torch.allclose(actual[1], field(
         changed[1:], positions[1:], masks[1:], visited[1:]
-    )[0])
+    )[0], atol=1e-6, rtol=1e-6)
 
 
 def test_gaussian_bev_uncertainty_controls_spatial_support(vilmodel):
