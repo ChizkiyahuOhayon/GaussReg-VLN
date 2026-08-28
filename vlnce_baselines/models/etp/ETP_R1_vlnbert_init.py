@@ -53,6 +53,9 @@ def get_vlnbert_models(config=None, dropout_rate=0.1):
     vis_config.gaussian_bev_hidden_size = getattr(
         config, 'gaussian_bev_hidden_size', 0
     )
+    vis_config.anchor_repair_hidden_size = getattr(
+        config, 'anchor_repair_hidden_size', 0
+    )
 
     vis_config.num_l_layers = 12
     vis_config.num_pano_layers = 2
@@ -101,4 +104,10 @@ def get_vlnbert_models(config=None, dropout_rate=0.1):
     if visual_model.gaussian_bev is not None and not has_gaussian_bev:
         # from_pretrained reinitializes missing keys after model.__init__.
         visual_model.gaussian_bev.reset_output()
+    has_anchor_repair = any(
+        'anchor_repair.' in key for key in new_ckpt_weights
+    )
+    if visual_model.anchor_repair is not None and not has_anchor_repair:
+        # from_pretrained reinitializes missing keys after model.__init__.
+        visual_model.anchor_repair.reset_output()
     return visual_model

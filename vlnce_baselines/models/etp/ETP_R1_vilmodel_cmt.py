@@ -792,7 +792,7 @@ class GaussianBEVResidual(nn.Module):
 
     def __init__(
         self, representation_size, position_size, hidden_size, grid_size=21,
-        extent=10.0, max_distance=30.0, location_noise=0.5,
+        extent=10.0, max_distance=30.0, location_noise=0.5, readout=True,
     ):
         super().__init__()
         if grid_size < 3 or grid_size % 2 == 0:
@@ -826,10 +826,13 @@ class GaussianBEVResidual(nn.Module):
         self.pointwise = nn.Conv2d(
             field_size, hidden_size, 1, bias=False
         )
-        self.output = nn.Linear(hidden_size, 1, bias=False)
+        self.output = (
+            nn.Linear(hidden_size, 1, bias=False) if readout else None
+        )
 
     def reset_output(self):
-        nn.init.zeros_(self.output.weight)
+        if self.output is not None:
+            nn.init.zeros_(self.output.weight)
 
     def _candidate_geometry(self, position_features):
         distance = (
@@ -906,7 +909,7 @@ class GaussianBEVResidual(nn.Module):
         ], dim=1)
         return torch.cat([features, scalars], dim=1), mass, spatial_mask
 
-    def forward(
+    def encode_contexts(
         self, representations, position_features, valid_mask, visited_mask
     ):
         if representations.shape[:2] != position_features.shape[:2]:
@@ -938,10 +941,113 @@ class GaussianBEVResidual(nn.Module):
         contexts = candidate_context.clone()
         contexts[:, 0] = stop_context
 
-        residual = self.output(torch.tanh(contexts)).squeeze(-1)
         output_mask = spatial_mask.clone()
         output_mask[:, 0] = valid_mask[:, 0]
+        return contexts, output_mask
+
+    def forward(
+        self, representations, position_features, valid_mask, visited_mask
+    ):
+        if self.output is None:
+            raise RuntimeError('Gaussian BEV readout is disabled')
+        contexts, output_mask = self.encode_contexts(
+            representations, position_features, valid_mask, visited_mask
+        )
+        residual = self.output(torch.tanh(contexts)).squeeze(-1)
         return residual * output_mask.to(dtype=residual.dtype)
+
+
+class AnchorRelativeRepair(nn.Module):
+    """Choose between preserving E0 and switching to another candidate."""
+
+    FIELD_SIZE = 32
+
+    def __init__(
+        self, representation_size, position_size, hidden_size,
+        layer_norm_eps,
+    ):
+        super().__init__()
+        self.representation_norm = BertLayerNorm(
+            representation_size, eps=layer_norm_eps
+        )
+        self.field = GaussianBEVResidual(
+            representation_size=representation_size,
+            position_size=position_size,
+            hidden_size=self.FIELD_SIZE,
+            readout=False,
+        )
+        input_size = (
+            representation_size + position_size + self.FIELD_SIZE + 1
+        )
+        self.hidden = nn.Linear(input_size, hidden_size)
+        self.output = nn.Linear(hidden_size, 1)
+
+    def reset_output(self):
+        nn.init.zeros_(self.output.weight)
+        nn.init.zeros_(self.output.bias)
+
+    def forward(
+        self, base_logits, representations, position_features,
+        valid_mask, visited_mask,
+    ):
+        if representations.shape[:2] != base_logits.shape:
+            raise ValueError('Anchor-repair representations and logits are misaligned')
+        if position_features.shape[:2] != base_logits.shape:
+            raise ValueError('Anchor-repair positions and logits are misaligned')
+        if valid_mask.shape != base_logits.shape:
+            raise ValueError('Anchor-repair valid mask and logits are misaligned')
+        if visited_mask.shape != base_logits.shape:
+            raise ValueError('Anchor-repair visit mask and logits are misaligned')
+
+        action_mask = valid_mask & visited_mask.logical_not()
+        masked_base_logits = base_logits.detach().masked_fill(
+            action_mask.logical_not(), -float('inf')
+        )
+        base_actions = masked_base_logits.argmax(dim=1)
+        batch_indices = torch.arange(
+            base_logits.size(0), device=base_logits.device
+        )
+
+        normalized = self.representation_norm(representations.detach())
+        position_features = position_features.to(dtype=normalized.dtype)
+        contexts, _ = self.field.encode_contexts(
+            representations.detach(), position_features, valid_mask,
+            visited_mask,
+        )
+        anchor_representations = normalized[
+            batch_indices, base_actions
+        ].unsqueeze(1)
+        anchor_positions = position_features[
+            batch_indices, base_actions
+        ].unsqueeze(1)
+        anchor_contexts = contexts[
+            batch_indices, base_actions
+        ].unsqueeze(1)
+        anchor_logits = masked_base_logits[
+            batch_indices, base_actions
+        ].unsqueeze(1)
+
+        safe_base_logits = masked_base_logits.masked_fill(
+            action_mask.logical_not(), 0.0
+        )
+        inputs = torch.cat([
+            normalized - anchor_representations,
+            position_features - anchor_positions,
+            contexts - anchor_contexts,
+            (safe_base_logits - anchor_logits).unsqueeze(-1),
+        ], dim=-1)
+        residual = self.output(gelu(self.hidden(inputs))).squeeze(-1)
+
+        alternatives = action_mask.sum(dim=1, keepdim=True) - 1
+        keep_prior = torch.log(
+            alternatives.to(dtype=residual.dtype) + 1.0
+        )
+        repair_logits = safe_base_logits - anchor_logits - keep_prior + residual
+        repair_logits = repair_logits.masked_fill(
+            action_mask.logical_not(), -float('inf')
+        )
+        repair_logits.scatter_(1, base_actions.unsqueeze(1), 0.0)
+        return repair_logits
 
 class GlocalTextPathNavCMT(BertPreTrainedModel): 
     def __init__(self, config):
@@ -978,6 +1084,25 @@ class GlocalTextPathNavCMT(BertPreTrainedModel):
             )
         else:
             self.gaussian_bev = None
+        anchor_repair_hidden_size = getattr(
+            config, 'anchor_repair_hidden_size', 0
+        )
+        if anchor_repair_hidden_size > 0:
+            if (self.candidate_scorer is not None or
+                    self.gaussian_bev is not None):
+                raise ValueError(
+                    'anchor_repair, candidate_scorer, and gaussian_bev '
+                    'are mutually exclusive'
+                )
+            position_size = 7 + getattr(config, 'gauss_feat_size', 0)
+            self.anchor_repair = AnchorRelativeRepair(
+                representation_size=config.hidden_size * 2,
+                position_size=position_size,
+                hidden_size=anchor_repair_hidden_size,
+                layer_norm_eps=config.layer_norm_eps,
+            )
+        else:
+            self.anchor_repair = None
 
         self.init_weights()
         if self.global_encoder.gmap_gauss_embedding is not None:
@@ -986,6 +1111,8 @@ class GlocalTextPathNavCMT(BertPreTrainedModel):
             self.candidate_scorer.reset_output()
         if self.gaussian_bev is not None:
             self.gaussian_bev.reset_output()
+        if self.anchor_repair is not None:
+            self.anchor_repair.reset_output()
         
         if config.fix_lang_embedding:
             print("FIX LANG EMBEDDING!!!!!!!!!!!!!!!!!!!!!!!!")
@@ -1085,8 +1212,17 @@ class GlocalTextPathNavCMT(BertPreTrainedModel):
         global_logits.masked_fill_(gmap_visited_masks, -float('inf'))
         global_logits.masked_fill_(gmap_masks.logical_not(), -float('inf'))
 
+        base_global_logits = global_logits
+        if self.anchor_repair is not None:
+            global_logits = self.anchor_repair(
+                base_global_logits, fusion_input, gmap_pos_fts,
+                gmap_masks, gmap_visited_masks,
+            )
+
         outs = {
             'gmap_embeds': gmap_embeds, 
             'global_logits': global_logits
         }
+        if self.anchor_repair is not None:
+            outs['base_global_logits'] = base_global_logits
         return outs

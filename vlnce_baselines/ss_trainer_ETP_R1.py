@@ -987,8 +987,14 @@ class RLTrainer(BaseVLNCETrainer):
             nav_outs = self.policy.net(**nav_inputs)
             nav_logits = nav_outs['global_logits']
             nav_probs = F.softmax(nav_logits, 1)
+            stop_score_logits = nav_outs.get(
+                'base_global_logits', nav_logits
+            )
+            stop_score_probs = F.softmax(stop_score_logits, 1)
             for i, gmap in enumerate(self.gmaps):
-                gmap.node_stop_scores[cur_vp[i]] = nav_probs[i, 0].data.item() 
+                gmap.node_stop_scores[cur_vp[i]] = (
+                    stop_score_probs[i, 0].data.item()
+                )
 
             if mode == 'train' or self.config.VIDEO_OPTION:
                 teacher_actions = self._teacher_action_new(nav_inputs['gmap_vp_ids'], no_vp_left, mode == 'train')

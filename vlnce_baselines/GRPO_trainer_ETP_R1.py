@@ -42,6 +42,7 @@ from .utils import (
     length2mask, dir_angle_feature_with_ele,
 )
 from vlnce_baselines.common.utils import dis_to_con, gather_list_and_concat
+from vlnce_baselines.anchor_relative import anchor_relative_advantages
 from habitat_extensions.measures import NDTW, StepsTaken
 from fastdtw import fastdtw
 
@@ -294,11 +295,33 @@ class RLTrainer(BaseVLNCETrainer):
             gaussian_bev_only = getattr(
                 self.config.GRPO, 'gaussian_bev_only', False
             )
-            if sum([gauss_only, scorer_only, gaussian_bev_only]) > 1:
+            anchor_repair_only = getattr(
+                self.config.GRPO, 'anchor_repair_only', False
+            )
+            if sum([
+                    gauss_only, scorer_only, gaussian_bev_only,
+                    anchor_repair_only]) > 1:
                 raise ValueError(
                     'GRPO lightweight-only modes are mutually exclusive'
                 )
-            if gaussian_bev_only:
+            if anchor_repair_only:
+                anchor_repair = vln_bert_module.anchor_repair
+                if anchor_repair is None:
+                    raise ValueError(
+                        'anchor_repair_only requires '
+                        'MODEL.anchor_repair_hidden_size > 0'
+                    )
+                if (self.config.GRPO.sample_num != 8 or
+                        self.config.MODEL.gauss_feat_size != 5 or
+                        self.config.MODEL.gauss_residual_scale != 0.0 or
+                        self.config.MODEL.candidate_scorer_hidden_size != 0 or
+                        self.config.MODEL.gaussian_bev_hidden_size != 0):
+                    raise ValueError(
+                        'E5 requires sample_num=8, gauss_feat_size=5, '
+                        'gauss_residual_scale=0.0, and no E3/E4 module'
+                    )
+                self.trainable_parts = [anchor_repair]
+            elif gaussian_bev_only:
                 gaussian_bev = vln_bert_module.gaussian_bev
                 if gaussian_bev is None:
                     raise ValueError(
@@ -388,6 +411,18 @@ class RLTrainer(BaseVLNCETrainer):
                 raise RuntimeError(
                     'Gaussian-BEV GRPO expected only a sub-0.1M field, '
                     'got invalid=%s and %d parameters' %
+                    (invalid_names, trainable_count)
+                )
+        if getattr(self.config.GRPO, 'anchor_repair_only', False):
+            trainable_count = sum(p.numel() for _, p in trainable_parameters)
+            invalid_names = [
+                name for name, _ in trainable_parameters
+                if '.anchor_repair.' not in name
+            ]
+            if invalid_names or trainable_count >= 200000:
+                raise RuntimeError(
+                    'Anchor-repair GRPO expected only a sub-0.2M repair '
+                    'module, got invalid=%s and %d parameters' %
                     (invalid_names, trainable_count)
                 )
         no_decay = ['bias', 'LayerNorm.bias', 'LayerNorm.weight']
@@ -545,6 +580,36 @@ class RLTrainer(BaseVLNCETrainer):
                             sorted(missing_names)
                         )
                     vln_bert_module.gaussian_bev.reset_output()
+            if getattr(self.config.GRPO, 'anchor_repair_only', False):
+                invalid_missing = [
+                    key for key in incompatible_keys.missing_keys
+                    if (not key.endswith('gmap_gauss_embedding.weight') and
+                        '.anchor_repair.' not in key)
+                ]
+                if invalid_missing or incompatible_keys.unexpected_keys:
+                    raise RuntimeError(
+                        'E5 checkpoint mismatch: missing=%s, unexpected=%s' %
+                        (invalid_missing, incompatible_keys.unexpected_keys)
+                    )
+                repair_missing = [
+                    key for key in incompatible_keys.missing_keys
+                    if '.anchor_repair.' in key
+                ]
+                if repair_missing:
+                    missing_names = {
+                        key.split('.anchor_repair.', 1)[1]
+                        for key in repair_missing
+                    }
+                    expected_names = {
+                        name for name, _ in
+                        vln_bert_module.anchor_repair.named_parameters()
+                    }
+                    if missing_names != expected_names:
+                        raise RuntimeError(
+                            'E5 checkpoint has a partial anchor repair: %s' %
+                            sorted(missing_names)
+                        )
+                    vln_bert_module.anchor_repair.reset_output()
 
             if config.GRPO.is_requeue:
                 self.optimizer.load_state_dict(ckpt_dict["optim_state"])
@@ -811,6 +876,9 @@ class RLTrainer(BaseVLNCETrainer):
         self.set_policy_mode("train")
 
         # --- 1. Pre-calculate advantages for all trajectories (done once for the entire buffer) ---
+        anchor_repair_only = getattr(
+            self.config.GRPO, 'anchor_repair_only', False
+        )
         advantages_all_ep_all_samples = [[0.0] * self.initial_num_envs for _ in range(self.config.GRPO.sample_num)]
         rewards_per_original_env_slot = [[] for _ in range(self.initial_num_envs)]
 
@@ -830,8 +898,35 @@ class RLTrainer(BaseVLNCETrainer):
                     if reward_val is not None:
                         advantages_all_ep_all_samples[s_idx][original_env_idx] = (reward_val - mean_r) / (std_r + 1e-8)
 
+        sample_indices = range(self.config.GRPO.sample_num)
+        if anchor_repair_only:
+            rewards = [sample['reward'] for sample in self.data_buffer]
+            advantages_all_ep_all_samples = anchor_relative_advantages(rewards)
+            sample_indices = range(1, self.config.GRPO.sample_num)
+            reward_deltas = []
+            for original_env_idx in range(self.initial_num_envs):
+                anchor_reward = rewards[0][original_env_idx]
+                if anchor_reward is None:
+                    continue
+                for s_idx in sample_indices:
+                    reward_val = rewards[s_idx][original_env_idx]
+                    if reward_val is not None:
+                        reward_deltas.append(reward_val - anchor_reward)
+            self.logs['reward_delta_to_anchor'].append(
+                np.mean(reward_deltas) if reward_deltas else 0.0
+            )
+            intervention_count = sum(
+                sample['intervention_count'] for sample in self.data_buffer[1:]
+            )
+            decision_count = sum(
+                sample['decision_count'] for sample in self.data_buffer[1:]
+            )
+            self.logs['intervention_rate'].append(
+                intervention_count / max(decision_count, 1)
+            )
+
         all_spls_in_buffer = []
-        for s_idx in range(self.config.GRPO.sample_num):
+        for s_idx in sample_indices:
             all_spls_in_buffer.extend([r for r in self.data_buffer[s_idx]["reward"] if r is not None])
         if all_spls_in_buffer:
             self.logs['reward'].append(np.mean(all_spls_in_buffer))
@@ -854,7 +949,7 @@ class RLTrainer(BaseVLNCETrainer):
 
             self.optimizer.zero_grad() 
 
-            for s_idx in range(self.config.GRPO.sample_num):
+            for s_idx in sample_indices:
                 current_sample_trajectory_steps_data = self.data_buffer[s_idx]["data_buffer"]
 
                 initial_txt_embeds_cuda = self.data_buffer[s_idx]["initial_txt_embeds"].to(self.device, non_blocking=True)
@@ -959,7 +1054,11 @@ class RLTrainer(BaseVLNCETrainer):
                 else:
                     logger.info("ERROR! total_actions_in_this_sample is 0")
             
-            if num_samples_processed_this_epoch == self.config.GRPO.sample_num:
+            expected_samples = (
+                self.config.GRPO.sample_num - 1
+                if anchor_repair_only else self.config.GRPO.sample_num
+            )
+            if num_samples_processed_this_epoch == expected_samples:
                 self.scaler.unscale_(self.optimizer)
 
                 trainable_params = [p for p in self.policy.parameters() if p.requires_grad]
@@ -979,7 +1078,11 @@ class RLTrainer(BaseVLNCETrainer):
                     total_combined_loss_across_epochs += ( (accumulated_policy_loss_this_epoch) / num_samples_processed_this_epoch )
                 actual_epochs_processed += 1
             else:
-                logger.info(f"Epoch {epoch+1}/{self.grpo_update_epochs}: actual samples != GRPO.sample_num.")
+                logger.info(
+                    f"Epoch {epoch+1}/{self.grpo_update_epochs}: "
+                    f"processed {num_samples_processed_this_epoch}/"
+                    f"{expected_samples} policy samples."
+                )
 
         if actual_epochs_processed > 0:
             self.logs['policy_loss'].append(total_policy_loss_across_epochs / actual_epochs_processed)
@@ -1027,6 +1130,10 @@ class RLTrainer(BaseVLNCETrainer):
         else:
             self.set_policy_mode("train")
         
+        anchor_repair_only = getattr(
+            self.config.GRPO, 'anchor_repair_only', False
+        )
+        anchor_episode_ids = None
         for i in range(sample_num):
             self.envs.resume_all()
             if i == 0:
@@ -1035,11 +1142,18 @@ class RLTrainer(BaseVLNCETrainer):
                 observations = self.envs.call(['reset_current_episode']*self.envs.num_envs)
             
             episodes_reset_ids = [ep.episode_id for i, ep in enumerate(self.envs.current_episodes())]
+            if anchor_episode_ids is None:
+                anchor_episode_ids = episodes_reset_ids
+            elif episodes_reset_ids != anchor_episode_ids:
+                raise RuntimeError('GRPO samples did not reset to the anchor episodes')
 
-            data_this_sample = self.sample_once(observations)
+            data_this_sample = self.sample_once(
+                observations,
+                use_base_policy=anchor_repair_only and i == 0,
+            )
             self.data_buffer.append(data_this_sample)
 
-    def sample_once(self, initial_obs):
+    def sample_once(self, initial_obs, use_base_policy=False):
         mode = 'train'
 
         instr_max_len = self.config.GRPO.max_text_len
@@ -1071,7 +1185,9 @@ class RLTrainer(BaseVLNCETrainer):
             "reward": [None] * self.envs.num_envs,
             "data_buffer": [],
             "initial_txt_embeds": all_txt_embeds.detach().cpu(),
-            "initial_txt_masks": all_txt_masks.detach().cpu()
+            "initial_txt_masks": all_txt_masks.detach().cpu(),
+            "intervention_count": 0,
+            "decision_count": 0,
         }
 
         total_actions = 0.
@@ -1150,15 +1266,33 @@ class RLTrainer(BaseVLNCETrainer):
 
             nav_inputs_copy_for_cpu = self.copy_nav_inputs_dict(nav_inputs)
             nav_outs = self.policy.net(**nav_inputs_for_gpu)
-            nav_logits = nav_outs['global_logits']
+            if use_base_policy:
+                nav_logits = nav_outs['base_global_logits']
+            else:
+                nav_logits = nav_outs['global_logits']
             nav_probs = F.softmax(nav_logits, 1)
+            stop_score_logits = nav_outs.get(
+                'base_global_logits', nav_logits
+            )
+            stop_score_probs = F.softmax(stop_score_logits, 1)
 
             for i, gmap in enumerate(self.gmaps):
-                gmap.node_stop_scores[cur_vp[i]] = nav_probs[i, 0].data.item() 
+                gmap.node_stop_scores[cur_vp[i]] = (
+                    stop_score_probs[i, 0].data.item()
+                )
 
             # determine action
-            c = torch.distributions.Categorical(nav_probs)
-            a_t = c.sample().detach()
+            if use_base_policy:
+                a_t = nav_logits.argmax(dim=-1)
+            else:
+                c = torch.distributions.Categorical(nav_probs)
+                a_t = c.sample().detach()
+                if getattr(self.config.GRPO, 'anchor_repair_only', False):
+                    base_actions = nav_outs['base_global_logits'].argmax(dim=-1)
+                    data_this_sample['intervention_count'] += (
+                        a_t != base_actions
+                    ).sum().item()
+                    data_this_sample['decision_count'] += a_t.numel()
             cpu_a_t = a_t.cpu().numpy()
 
             # ------------------- start store data ------------------- 

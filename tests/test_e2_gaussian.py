@@ -430,6 +430,89 @@ def test_gaussian_bev_uncertainty_controls_spatial_support(vilmodel):
     assert wide[0, 1].sum() > narrow[0, 1].sum()
 
 
+def _new_anchor_repair(module):
+    repair = module.AnchorRelativeRepair(
+        representation_size=1536,
+        position_size=12,
+        hidden_size=64,
+        layer_norm_eps=1e-12,
+    )
+    repair.reset_output()
+    return repair
+
+
+def test_anchor_repair_is_an_exact_greedy_no_op_and_detached(vilmodel):
+    repair = _new_anchor_repair(vilmodel)
+    representations, positions, masks, visited = _gaussian_bev_inputs()
+    base_logits = torch.tensor([
+        [0.2, 10.0, 1.0, 0.5],
+        [1.5, 10.0, 1.0, 0.5],
+    ])
+
+    repair_logits = repair(
+        base_logits, representations, positions, masks, visited
+    )
+    masked_base = base_logits.masked_fill(visited, -float('inf'))
+
+    assert torch.equal(repair_logits.argmax(dim=-1), masked_base.argmax(dim=-1))
+    assert torch.isneginf(repair_logits[visited]).all()
+    assert sum(parameter.numel() for parameter in repair.parameters()) == 154972
+    assert torch.count_nonzero(repair.output.weight) == 0
+
+    repair_logits[torch.isfinite(repair_logits)].sum().backward()
+    assert representations.grad is None
+    assert torch.count_nonzero(repair.output.weight.grad) > 0
+
+
+def test_anchor_repair_strictly_prefers_keep_on_tied_base_logits(vilmodel):
+    repair = _new_anchor_repair(vilmodel)
+    representations, positions, masks, visited = _gaussian_bev_inputs(
+        batch_size=1
+    )
+    masks[:, 2:] = False
+    visited.zero_()
+    base_logits = torch.zeros(1, 4)
+
+    repair_logits = repair(
+        base_logits, representations, positions, masks, visited
+    )
+
+    assert repair_logits.argmax(dim=-1).item() == 0
+    assert repair_logits[0, 0].item() == 0.0
+    assert repair_logits[0, 1].item() < 0.0
+    assert torch.isneginf(repair_logits[0, 2:]).all()
+
+
+def test_anchor_relative_advantages_use_the_base_trajectory():
+    module = _load_module(
+        'anchor_relative_for_test',
+        REPO_ROOT / 'vlnce_baselines/anchor_relative.py',
+    )
+    rewards = [
+        [2.0, None],
+        [3.0, 1.0],
+        [1.0, 2.0],
+        [2.0, 3.0],
+        [2.0, 4.0],
+        [2.0, 5.0],
+        [2.0, 6.0],
+        [2.0, 7.0],
+    ]
+
+    advantages = module.anchor_relative_advantages(rewards)
+
+    assert advantages[0] == [0.0, 0.0]
+    assert advantages[1][0] == pytest.approx(np.sqrt(7.0 / 2.0))
+    assert advantages[2][0] == pytest.approx(-np.sqrt(7.0 / 2.0))
+    assert advantages[3][0] == 0.0
+    assert all(row[1] == 0.0 for row in advantages)
+
+    equal_rewards = [[2.0], [2.0], [2.0], [2.0]]
+    assert module.anchor_relative_advantages(equal_rewards) == [
+        [0.0], [0.0], [0.0], [0.0]
+    ]
+
+
 def test_gaussian_bev_out_of_range_candidate_falls_back_to_e0(vilmodel):
     field = _new_gaussian_bev(vilmodel)
     with torch.no_grad():
