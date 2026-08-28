@@ -20,6 +20,22 @@ def _load_module(name, path):
     return module
 
 
+def test_e5_smoke_bootstraps_the_repository_root():
+    original_path = list(sys.path)
+    sys.path[:] = [
+        path for path in sys.path
+        if Path(path or '.').resolve() != REPO_ROOT
+    ]
+    try:
+        _load_module(
+            'smoke_e5_model_for_test',
+            REPO_ROOT / 'tools/smoke_e5_model.py',
+        )
+        assert sys.path[0] == str(REPO_ROOT)
+    finally:
+        sys.path[:] = original_path
+
+
 @pytest.fixture(scope='module')
 def graph_utils():
     habitat = types.ModuleType('habitat')
