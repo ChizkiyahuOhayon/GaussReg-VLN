@@ -102,6 +102,7 @@ GRPO:
   gaussian_bev_only: False
   anchor_repair_only: False
   hindsight_stop_only: False
+  terminal_commit_only: False
 
   T_start: 2.0
   T_end: 1.0
@@ -123,6 +124,7 @@ MODEL:
   gaussian_bev_hidden_size: 0
   anchor_repair_hidden_size: 0
   hindsight_stop_hidden_size: 0
+  terminal_commit_hidden_size: 0
   merge_ghost: True
   consume_ghost: True
   

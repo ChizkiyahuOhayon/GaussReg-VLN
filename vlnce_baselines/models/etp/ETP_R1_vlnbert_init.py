@@ -59,6 +59,9 @@ def get_vlnbert_models(config=None, dropout_rate=0.1):
     vis_config.hindsight_stop_hidden_size = getattr(
         config, 'hindsight_stop_hidden_size', 0
     )
+    vis_config.terminal_commit_hidden_size = getattr(
+        config, 'terminal_commit_hidden_size', 0
+    )
 
     vis_config.num_l_layers = 12
     vis_config.num_pano_layers = 2
@@ -119,4 +122,10 @@ def get_vlnbert_models(config=None, dropout_rate=0.1):
     if visual_model.hindsight_stop is not None and not has_hindsight_stop:
         # from_pretrained reinitializes missing keys after model.__init__.
         visual_model.hindsight_stop.reset_output()
+    has_terminal_commit = any(
+        'terminal_commit.' in key for key in new_ckpt_weights
+    )
+    if visual_model.terminal_commit is not None and not has_terminal_commit:
+        # from_pretrained reinitializes missing keys after model.__init__.
+        visual_model.terminal_commit.reset_output()
     return visual_model

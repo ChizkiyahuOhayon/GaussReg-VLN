@@ -52,6 +52,22 @@ def test_e6_smoke_bootstraps_the_repository_root():
         sys.path[:] = original_path
 
 
+def test_e7_smoke_bootstraps_the_repository_root():
+    original_path = list(sys.path)
+    sys.path[:] = [
+        path for path in sys.path
+        if Path(path or '.').resolve() != REPO_ROOT
+    ]
+    try:
+        _load_module(
+            'smoke_e7_model_for_test',
+            REPO_ROOT / 'tools/smoke_e7_model.py',
+        )
+        assert sys.path[0] == str(REPO_ROOT)
+    finally:
+        sys.path[:] = original_path
+
+
 @pytest.fixture(scope='module')
 def graph_utils():
     habitat = types.ModuleType('habitat')
@@ -642,3 +658,74 @@ def test_counterfactual_stop_return_and_continue_target():
     assert target.item() == 2
     assert stop_returns[0, 1].item() == pytest.approx(17.0 / 6.0)
     assert stop_returns[0, 2].item() < stop_returns[0, 1].item()
+
+
+def _new_terminal_commit_head(module):
+    head = module.TerminalCommitHead(
+        representation_size=1536,
+        hidden_size=128,
+        layer_norm_eps=1e-12,
+    )
+    head.reset_output()
+    return head
+
+
+def test_terminal_commit_is_an_exact_e0_terminal_no_op(vilmodel):
+    head = _new_terminal_commit_head(vilmodel)
+    representations = torch.randn(2, 5, 1536, requires_grad=True)
+    base_stop_scores = torch.tensor([
+        [0.0, 0.7, 0.4, 0.1, 0.0],
+        [0.0, 0.2, 0.6, 0.8, 0.0],
+    ], requires_grad=True)
+    step_ids = torch.tensor([
+        [0, 1, 2, 0, 0],
+        [0, 1, 2, 3, 0],
+    ])
+    pair_distances = torch.zeros(2, 5, 5)
+    valid_mask = torch.tensor([
+        [True, True, True, True, False],
+        [True, True, True, True, True],
+    ])
+    visited_mask = torch.tensor([
+        [False, True, True, False, False],
+        [False, True, True, True, False],
+    ])
+
+    logits = head(
+        representations, base_stop_scores, step_ids, pair_distances,
+        valid_mask, visited_mask,
+    )
+
+    assert logits.argmax(dim=-1).tolist() == [1, 3]
+    assert torch.equal(logits[visited_mask], base_stop_scores[visited_mask])
+    assert torch.isneginf(logits[visited_mask.logical_not()]).all()
+    assert sum(parameter.numel() for parameter in head.parameters()) == 200321
+
+    logits[torch.isfinite(logits)].sum().backward()
+    assert representations.grad is None
+    assert base_stop_scores.grad is None
+    assert torch.count_nonzero(head.output.weight.grad) > 0
+
+
+def test_terminal_commit_return_charges_the_full_route_and_rollback():
+    module = _load_module(
+        'terminal_commit_returns_for_test',
+        REPO_ROOT / 'vlnce_baselines/hindsight_stop.py',
+    )
+    common = {
+        'goal_distances': torch.tensor([[1.0]]),
+        'rollback_distances': torch.tensor([[2.0]]),
+        'shortest_path_length': torch.tensor([7.0]),
+        'success_distance': 3.0,
+        'distance_scale': 6.0,
+    }
+
+    short_route = module.counterfactual_stop_returns(
+        path_length=torch.tensor([5.0]), **common
+    )
+    long_route = module.counterfactual_stop_returns(
+        path_length=torch.tensor([10.0]), **common
+    )
+
+    assert short_route.item() == pytest.approx(17.0 / 6.0)
+    assert long_route.item() < short_route.item()

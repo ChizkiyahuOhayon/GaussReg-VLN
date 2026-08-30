@@ -1113,6 +1113,66 @@ class HindsightStopHead(nn.Module):
         logits = self.output(gelu(self.hidden(inputs))).squeeze(-1)
         return logits.masked_fill(stop_mask.logical_not(), -float('inf'))
 
+
+class TerminalCommitHead(nn.Module):
+    """Rerank visited nodes only after the movement policy terminates."""
+
+    def __init__(self, representation_size, hidden_size, layer_norm_eps):
+        super().__init__()
+        self.representation_norm = BertLayerNorm(
+            representation_size, eps=layer_norm_eps
+        )
+        self.hidden = nn.Linear(representation_size + 3, hidden_size)
+        self.output = nn.Linear(hidden_size, 1)
+
+    def reset_output(self):
+        nn.init.zeros_(self.output.weight)
+        nn.init.zeros_(self.output.bias)
+
+    def forward(
+        self, representations, base_stop_scores, step_ids, pair_distances,
+        valid_mask, visited_mask,
+    ):
+        if representations.shape[:2] != valid_mask.shape:
+            raise ValueError('Terminal-commit representations and masks are misaligned')
+        if base_stop_scores.shape != valid_mask.shape:
+            raise ValueError('Terminal-commit scores and masks are misaligned')
+        if step_ids.shape != valid_mask.shape:
+            raise ValueError('Terminal-commit step ids and masks are misaligned')
+        if visited_mask.shape != valid_mask.shape:
+            raise ValueError('Terminal-commit visit and valid masks are misaligned')
+        if pair_distances.shape != (
+                valid_mask.size(0), valid_mask.size(1), valid_mask.size(1)):
+            raise ValueError('Terminal-commit pair distances are misaligned')
+
+        commit_mask = valid_mask & visited_mask
+        normalized = self.representation_norm(representations.detach())
+        visited_steps = step_ids.masked_fill(visited_mask.logical_not(), -1)
+        current_indices = visited_steps.argmax(dim=1)
+        batch_indices = torch.arange(
+            representations.size(0), device=representations.device
+        )
+        current = normalized[batch_indices, current_indices].unsqueeze(1)
+        relative = normalized - current
+
+        max_steps = step_ids.max(dim=1, keepdim=True).values.clamp_min(1)
+        visit_time = step_ids.to(normalized.dtype) / max_steps.to(
+            normalized.dtype
+        )
+        graph_distance = pair_distances[
+            batch_indices, current_indices
+        ].to(normalized.dtype)
+        base_scores = base_stop_scores.detach().to(normalized.dtype)
+        inputs = torch.cat([
+            relative,
+            visit_time.unsqueeze(-1),
+            graph_distance.unsqueeze(-1),
+            base_scores.unsqueeze(-1),
+        ], dim=-1)
+        residual = self.output(gelu(self.hidden(inputs))).squeeze(-1)
+        logits = base_scores + residual
+        return logits.masked_fill(commit_mask.logical_not(), -float('inf'))
+
 class GlocalTextPathNavCMT(BertPreTrainedModel): 
     def __init__(self, config):
         super().__init__(config)
@@ -1185,6 +1245,24 @@ class GlocalTextPathNavCMT(BertPreTrainedModel):
             )
         else:
             self.hindsight_stop = None
+        terminal_commit_hidden_size = getattr(
+            config, 'terminal_commit_hidden_size', 0
+        )
+        if terminal_commit_hidden_size > 0:
+            if (self.candidate_scorer is not None or
+                    self.gaussian_bev is not None or
+                    self.anchor_repair is not None or
+                    self.hindsight_stop is not None):
+                raise ValueError(
+                    'terminal_commit and E3-E6 modules are mutually exclusive'
+                )
+            self.terminal_commit = TerminalCommitHead(
+                representation_size=config.hidden_size * 2,
+                hidden_size=terminal_commit_hidden_size,
+                layer_norm_eps=config.layer_norm_eps,
+            )
+        else:
+            self.terminal_commit = None
 
         self.init_weights()
         if self.global_encoder.gmap_gauss_embedding is not None:
@@ -1197,6 +1275,8 @@ class GlocalTextPathNavCMT(BertPreTrainedModel):
             self.anchor_repair.reset_output()
         if self.hindsight_stop is not None:
             self.hindsight_stop.reset_output()
+        if self.terminal_commit is not None:
+            self.terminal_commit.reset_output()
         
         if config.fix_lang_embedding:
             print("FIX LANG EMBEDDING!!!!!!!!!!!!!!!!!!!!!!!!")
@@ -1254,7 +1334,8 @@ class GlocalTextPathNavCMT(BertPreTrainedModel):
         self, txt_embeds, txt_masks, 
         gmap_vpids, gmap_step_ids, 
         gmap_img_fts, gmap_pos_fts, 
-        gmap_masks, gmap_visited_masks, gmap_pair_dists, gmap_task_embeddings
+        gmap_masks, gmap_visited_masks, gmap_pair_dists, gmap_task_embeddings,
+        gmap_stop_scores=None,
     ):
         # global branch
         batch_size = gmap_task_embeddings.size(0)
@@ -1310,12 +1391,38 @@ class GlocalTextPathNavCMT(BertPreTrainedModel):
                 gmap_pair_dists, gmap_masks, gmap_visited_masks,
             )
 
+        terminal_commit_logits = None
+        if self.terminal_commit is not None:
+            if gmap_stop_scores is None:
+                raise ValueError('terminal_commit requires gmap_stop_scores')
+            terminal_scores = gmap_stop_scores.clone()
+            current_indices = gmap_step_ids.masked_fill(
+                gmap_visited_masks.logical_not(), -1
+            ).argmax(dim=1)
+            batch_indices = torch.arange(
+                batch_size, device=gmap_step_ids.device
+            )
+            current_stop_scores = F.softmax(
+                base_global_logits, dim=1
+            )[:, 0]
+            terminal_scores[batch_indices, current_indices] = (
+                current_stop_scores
+            )
+            terminal_commit_logits = self.terminal_commit(
+                fusion_input, terminal_scores, gmap_step_ids,
+                gmap_pair_dists, gmap_masks, gmap_visited_masks,
+            )
+
         outs = {
             'gmap_embeds': gmap_embeds, 
             'global_logits': global_logits
         }
-        if self.anchor_repair is not None or self.hindsight_stop is not None:
+        if (self.anchor_repair is not None or
+                self.hindsight_stop is not None or
+                self.terminal_commit is not None):
             outs['base_global_logits'] = base_global_logits
         if hindsight_stop_logits is not None:
             outs['hindsight_stop_logits'] = hindsight_stop_logits
+        if terminal_commit_logits is not None:
+            outs['terminal_commit_logits'] = terminal_commit_logits
         return outs

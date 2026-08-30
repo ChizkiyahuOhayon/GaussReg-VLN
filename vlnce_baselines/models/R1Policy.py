@@ -163,8 +163,9 @@ class ETP(Net):
                 rgb_fts=None, dep_fts=None, loc_fts=None, 
                 nav_types=None, view_lens=None,
                 gmap_vp_ids=None, gmap_step_ids=None,
-                gmap_img_fts=None, gmap_pos_fts=None, 
-                gmap_masks=None, gmap_visited_masks=None, gmap_pair_dists=None, gmap_task_embeddings=None):
+                gmap_img_fts=None, gmap_pos_fts=None,
+                gmap_masks=None, gmap_visited_masks=None, gmap_pair_dists=None,
+                gmap_task_embeddings=None, gmap_stop_scores=None):
 
         if mode == 'language':
             encoded_sentence = self.vln_bert.forward_txt(
@@ -354,10 +355,11 @@ class ETP(Net):
 
         elif mode == 'navigation':
             outs = self.vln_bert.forward_navigation(
-                txt_embeds, txt_masks, 
+                txt_embeds, txt_masks,
                 gmap_vp_ids, gmap_step_ids,
-                gmap_img_fts, gmap_pos_fts, 
-                gmap_masks, gmap_visited_masks, gmap_pair_dists, gmap_task_embeddings
+                gmap_img_fts, gmap_pos_fts,
+                gmap_masks, gmap_visited_masks, gmap_pair_dists,
+                gmap_task_embeddings, gmap_stop_scores,
             )
             return outs
 

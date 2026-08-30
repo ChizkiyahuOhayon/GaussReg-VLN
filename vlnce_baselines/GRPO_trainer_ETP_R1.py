@@ -305,13 +305,36 @@ class RLTrainer(BaseVLNCETrainer):
             hindsight_stop_only = getattr(
                 self.config.GRPO, 'hindsight_stop_only', False
             )
+            terminal_commit_only = getattr(
+                self.config.GRPO, 'terminal_commit_only', False
+            )
             if sum([
                     gauss_only, scorer_only, gaussian_bev_only,
-                    anchor_repair_only, hindsight_stop_only]) > 1:
+                    anchor_repair_only, hindsight_stop_only,
+                    terminal_commit_only]) > 1:
                 raise ValueError(
                     'GRPO lightweight-only modes are mutually exclusive'
                 )
-            if hindsight_stop_only:
+            if terminal_commit_only:
+                terminal_commit = vln_bert_module.terminal_commit
+                if terminal_commit is None:
+                    raise ValueError(
+                        'terminal_commit_only requires '
+                        'MODEL.terminal_commit_hidden_size > 0'
+                    )
+                if (self.config.GRPO.sample_num != 1 or
+                        self.config.MODEL.task_type != 'r2r' or
+                        self.config.MODEL.gauss_feat_size != 0 or
+                        self.config.MODEL.candidate_scorer_hidden_size != 0 or
+                        self.config.MODEL.gaussian_bev_hidden_size != 0 or
+                        self.config.MODEL.anchor_repair_hidden_size != 0 or
+                        self.config.MODEL.hindsight_stop_hidden_size != 0):
+                    raise ValueError(
+                        'E7-1 requires R2R, sample_num=1, '
+                        'gauss_feat_size=0, and no E3-E6 module'
+                    )
+                self.trainable_parts = [terminal_commit]
+            elif hindsight_stop_only:
                 hindsight_stop = vln_bert_module.hindsight_stop
                 if hindsight_stop is None:
                     raise ValueError(
@@ -459,6 +482,18 @@ class RLTrainer(BaseVLNCETrainer):
             if invalid_names or trainable_count >= 250000:
                 raise RuntimeError(
                     'Hindsight-stop training expected only a sub-0.25M head, '
+                    'got invalid=%s and %d parameters' %
+                    (invalid_names, trainable_count)
+                )
+        if getattr(self.config.GRPO, 'terminal_commit_only', False):
+            trainable_count = sum(p.numel() for _, p in trainable_parameters)
+            invalid_names = [
+                name for name, _ in trainable_parameters
+                if '.terminal_commit.' not in name
+            ]
+            if invalid_names or trainable_count >= 250000:
+                raise RuntimeError(
+                    'Terminal-commit training expected only a sub-0.25M head, '
                     'got invalid=%s and %d parameters' %
                     (invalid_names, trainable_count)
                 )
@@ -676,6 +711,35 @@ class RLTrainer(BaseVLNCETrainer):
                             sorted(missing_names)
                         )
                     vln_bert_module.hindsight_stop.reset_output()
+            if getattr(self.config.GRPO, 'terminal_commit_only', False):
+                invalid_missing = [
+                    key for key in incompatible_keys.missing_keys
+                    if '.terminal_commit.' not in key
+                ]
+                if invalid_missing or incompatible_keys.unexpected_keys:
+                    raise RuntimeError(
+                        'E7 checkpoint mismatch: missing=%s, unexpected=%s' %
+                        (invalid_missing, incompatible_keys.unexpected_keys)
+                    )
+                commit_missing = [
+                    key for key in incompatible_keys.missing_keys
+                    if '.terminal_commit.' in key
+                ]
+                if commit_missing:
+                    missing_names = {
+                        key.split('.terminal_commit.', 1)[1]
+                        for key in commit_missing
+                    }
+                    expected_names = {
+                        name for name, _ in
+                        vln_bert_module.terminal_commit.named_parameters()
+                    }
+                    if missing_names != expected_names:
+                        raise RuntimeError(
+                            'E7 checkpoint has a partial terminal-commit '
+                            'head: %s' % sorted(missing_names)
+                        )
+                    vln_bert_module.terminal_commit.reset_output()
 
             if config.GRPO.is_requeue:
                 self.optimizer.load_state_dict(ckpt_dict["optim_state"])
@@ -937,6 +1001,10 @@ class RLTrainer(BaseVLNCETrainer):
     def update(self):
         if not self.data_buffer:
             logger.info("Data buffer is empty. Skipping update.")
+            return
+
+        if getattr(self.config.GRPO, 'terminal_commit_only', False):
+            self._update_terminal_commit()
             return
 
         if getattr(self.config.GRPO, 'hindsight_stop_only', False):
@@ -1305,6 +1373,92 @@ class RLTrainer(BaseVLNCETrainer):
 
         self.data_buffer.clear()
         self.optimizer.zero_grad()
+
+    def _update_terminal_commit(self):
+        self.set_policy_mode("train")
+        sample = self.data_buffer[0]
+        examples = sample["terminal_examples"]
+        if not examples:
+            logger.info("Terminal-commit trajectory has no terminal example.")
+            self.data_buffer.clear()
+            return
+
+        self.optimizer.zero_grad()
+        total_loss = 0.0
+        reselections = 0
+        recoveries = 0
+        regressions = 0
+        reach_rewards = []
+        initial_txt_embeds = sample["initial_txt_embeds"].to(
+            self.device, non_blocking=True
+        )
+        initial_txt_masks = sample["initial_txt_masks"].to(
+            self.device, non_blocking=True
+        )
+
+        for example in examples:
+            nav_inputs = {
+                key: value.to(self.device, non_blocking=True)
+                if isinstance(value, torch.Tensor) else value
+                for key, value in example["input"].items()
+            }
+            index = example["index"]
+            nav_inputs.update({
+                'txt_embeds': initial_txt_embeds[index:index + 1],
+                'txt_masks': initial_txt_masks[index:index + 1],
+                'mode': 'navigation',
+            })
+            logits = self.policy.net(**nav_inputs)[
+                'terminal_commit_logits'
+            ]
+            returns = example['returns'].to(
+                self.device, non_blocking=True
+            )
+            target = returns.argmax(dim=1)
+            loss = F.cross_entropy(logits, target) / len(examples)
+            self.scaler.scale(loss).backward()
+            total_loss += loss.item()
+
+            with torch.no_grad():
+                prediction = logits.argmax(dim=1)
+                base_choice = example['base_choice'].to(self.device)
+                success = example['success'].to(self.device)
+                rows = torch.arange(prediction.size(0), device=self.device)
+                predicted_success = success[rows, prediction]
+                base_success = success[rows, base_choice]
+                reselections += (prediction != base_choice).sum().item()
+                recoveries += (
+                    predicted_success & base_success.logical_not()
+                ).sum().item()
+                regressions += (
+                    predicted_success.logical_not() & base_success
+                ).sum().item()
+                reach_rewards.extend(returns.max(dim=1).values.cpu().tolist())
+
+        self.scaler.unscale_(self.optimizer)
+        trainable_params = [
+            parameter for parameter in self.policy.parameters()
+            if parameter.requires_grad
+        ]
+        grad_norm = torch.nn.utils.clip_grad_norm_(
+            trainable_params, self.max_grad_norm
+        )
+        self.scaler.step(self.optimizer)
+        self.scaler.update()
+        self.scheduler.step()
+
+        count = len(examples)
+        self.logs['terminal_commit_loss'].append(total_loss)
+        self.logs['total_loss'].append(total_loss)
+        self.logs['grad_norm'].append(grad_norm.item())
+        self.logs['terminal_reselection_rate'].append(reselections / count)
+        self.logs['terminal_recoveries'].append(recoveries / count)
+        self.logs['terminal_regressions'].append(regressions / count)
+        self.logs['reach_reward'].append(np.mean(reach_rewards))
+        self.logs['final_reward'].extend(sample['reward'])
+
+        self.data_buffer.clear()
+        self.optimizer.zero_grad()
     
     def get_pos_ori(self):
         pos_ori = self.envs.call(['get_pos_ori']*self.envs.num_envs)
@@ -1359,6 +1513,9 @@ class RLTrainer(BaseVLNCETrainer):
         hindsight_stop_only = getattr(
             self.config.GRPO, 'hindsight_stop_only', False
         )
+        terminal_commit_only = getattr(
+            self.config.GRPO, 'terminal_commit_only', False
+        )
 
         instr_max_len = self.config.GRPO.max_text_len
         instr_pad_id = 1
@@ -1394,6 +1551,7 @@ class RLTrainer(BaseVLNCETrainer):
             "decision_count": 0,
             "success": [None] * self.envs.num_envs,
             "oracle_success": [None] * self.envs.num_envs,
+            "terminal_examples": [],
         }
 
         total_actions = 0.
@@ -1463,7 +1621,7 @@ class RLTrainer(BaseVLNCETrainer):
                                         cand_vp[i], cand_pos[i], cand_embeds,
                                         cand_real_pos[i])
 
-            if hindsight_stop_only:
+            if hindsight_stop_only or terminal_commit_only:
                 for i, gmap in enumerate(self.gmaps):
                     distance = self.envs.call_at(
                         i, 'point_dist_to_goal',
@@ -1478,6 +1636,16 @@ class RLTrainer(BaseVLNCETrainer):
                 'mode': 'navigation',
             })
             no_vp_left = nav_inputs.pop('no_vp_left') 
+
+            if terminal_commit_only:
+                gmap_stop_scores = torch.zeros_like(
+                    nav_inputs['gmap_step_ids'], dtype=torch.float32
+                )
+                for i, gmap in enumerate(self.gmaps):
+                    for j, vp in enumerate(nav_inputs['gmap_vp_ids'][i][1:], 1):
+                        if vp in gmap.node_stop_scores:
+                            gmap_stop_scores[i, j] = gmap.node_stop_scores[vp]
+                nav_inputs['gmap_stop_scores'] = gmap_stop_scores
 
             stop_returns = None
             stop_success = None
@@ -1547,7 +1715,7 @@ class RLTrainer(BaseVLNCETrainer):
                 )
 
             # determine action
-            if hindsight_stop_only or use_base_policy:
+            if hindsight_stop_only or terminal_commit_only or use_base_policy:
                 a_t = nav_logits.argmax(dim=-1)
             else:
                 c = torch.distributions.Categorical(nav_probs)
@@ -1560,6 +1728,66 @@ class RLTrainer(BaseVLNCETrainer):
                     data_this_sample['decision_count'] += a_t.numel()
             cpu_a_t = a_t.cpu().numpy()
 
+            if terminal_commit_only:
+                success_distance = float(
+                    self.config.TASK_CONFIG.TASK.SUCCESS_DISTANCE
+                )
+                for i, gmap in enumerate(self.gmaps):
+                    will_stop = (
+                        cpu_a_t[i] == 0 or stepk == self.max_len - 1 or
+                        no_vp_left[i]
+                    )
+                    if not will_stop:
+                        continue
+                    node_vps = nav_inputs['gmap_vp_ids'][i][
+                        1:1 + len(gmap.node_pos)
+                    ]
+                    goal_distances = torch.tensor([
+                        goal_distance_cache[i][vp] for vp in node_vps
+                    ], dtype=torch.float32).unsqueeze(0)
+                    rollback_distances = torch.tensor([
+                        gmap.shortest_dist[cur_vp[i]][vp]
+                        for vp in node_vps
+                    ], dtype=torch.float32).unsqueeze(0)
+                    values = counterfactual_stop_returns(
+                        goal_distances,
+                        rollback_distances,
+                        path_length=torch.tensor([path_lengths[i]]),
+                        shortest_path_length=torch.tensor([
+                            shortest_path_lengths[i]
+                        ]),
+                        success_distance=success_distance,
+                        distance_scale=6.0,
+                    ).squeeze(0)
+                    returns = torch.full(
+                        (1, nav_inputs['gmap_step_ids'].size(1)),
+                        -float('inf'), dtype=torch.float32,
+                    )
+                    success = torch.zeros_like(returns, dtype=torch.bool)
+                    returns[0, 1:1 + len(node_vps)] = values
+                    success[0, 1:1 + len(node_vps)] = (
+                        goal_distances.squeeze(0) <= success_distance
+                    )
+                    base_choice = max(
+                        range(1, 1 + len(node_vps)),
+                        key=lambda index: gmap.node_stop_scores[node_vps[index - 1]],
+                    )
+                    example_input = {}
+                    for key, value in nav_inputs_copy_for_cpu.items():
+                        if isinstance(value, torch.Tensor):
+                            example_input[key] = value[i:i + 1]
+                        elif isinstance(value, list):
+                            example_input[key] = [copy.deepcopy(value[i])]
+                        else:
+                            example_input[key] = copy.deepcopy(value)
+                    data_this_sample['terminal_examples'].append({
+                        'input': example_input,
+                        'index': not_done_index[i],
+                        'returns': returns,
+                        'success': success,
+                        'base_choice': torch.tensor([base_choice]),
+                    })
+
             # ------------------- start store data ------------------- 
             data_this_stepk = {}
             data_this_stepk["input"] = nav_inputs_copy_for_cpu 
@@ -1570,7 +1798,8 @@ class RLTrainer(BaseVLNCETrainer):
                 data_this_stepk["stop_returns"] = stop_returns
                 data_this_stepk["stop_success"] = stop_success
                 data_this_stepk["stop_valid_mask"] = stop_valid_mask
-            data_this_sample['data_buffer'].append(data_this_stepk)
+            if not terminal_commit_only:
+                data_this_sample['data_buffer'].append(data_this_stepk)
             # ------------------- end store data ------------------- 
 
             # make equiv action
@@ -1636,7 +1865,7 @@ class RLTrainer(BaseVLNCETrainer):
 
             outputs = self.envs.step(env_actions)
             observations, _, dones, infos = [list(x) for x in zip(*outputs)]
-            if hindsight_stop_only:
+            if hindsight_stop_only or terminal_commit_only:
                 for i, info in enumerate(infos):
                     prefix_path = np.asarray(
                         info['position_train']['position']
@@ -1660,7 +1889,8 @@ class RLTrainer(BaseVLNCETrainer):
                     metric['distance_to_goal'] = distances[-1]
                     success_distance = (
                         float(self.config.TASK_CONFIG.TASK.SUCCESS_DISTANCE)
-                        if hindsight_stop_only else 1.5
+                        if (hindsight_stop_only or terminal_commit_only)
+                        else 1.5
                     )
                     metric['success'] = 1. if distances[-1] <= success_distance else 0.
                     metric['oracle_success'] = 1. if (distances <= success_distance).any() else 0.
@@ -1675,7 +1905,7 @@ class RLTrainer(BaseVLNCETrainer):
                     data_this_sample["oracle_success"][not_done_index[i]] = any(
                         distance <= success_distance
                         for distance in goal_distance_cache[i].values()
-                    ) if hindsight_stop_only else bool(metric['oracle_success'])
+                    ) if (hindsight_stop_only or terminal_commit_only) else bool(metric['oracle_success'])
                     self.logs['spl_reward'].append(metric['spl'])
                     self.logs['success_reward'].append(metric['success'])
                     self.logs['NE'].append(metric['distance_to_goal'])

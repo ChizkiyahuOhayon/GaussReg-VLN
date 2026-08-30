@@ -984,10 +984,21 @@ class RLTrainer(BaseVLNCETrainer):
                 'txt_masks': txt_masks, 
             })
             no_vp_left = nav_inputs.pop('no_vp_left') 
+            if getattr(
+                    self.config.MODEL, 'terminal_commit_hidden_size', 0) > 0:
+                gmap_stop_scores = torch.zeros_like(
+                    nav_inputs['gmap_step_ids'], dtype=torch.float32
+                )
+                for i, gmap in enumerate(self.gmaps):
+                    for j, vp in enumerate(nav_inputs['gmap_vp_ids'][i][1:], 1):
+                        if vp in gmap.node_stop_scores:
+                            gmap_stop_scores[i, j] = gmap.node_stop_scores[vp]
+                nav_inputs['gmap_stop_scores'] = gmap_stop_scores
             nav_outs = self.policy.net(**nav_inputs)
             nav_logits = nav_outs['global_logits']
             nav_probs = F.softmax(nav_logits, 1)
             hindsight_stop_vps = [None] * self.envs.num_envs
+            terminal_commit_vps = [None] * self.envs.num_envs
             stop_score_logits = nav_outs.get(
                 'base_global_logits', nav_logits
             )
@@ -1022,6 +1033,14 @@ class RLTrainer(BaseVLNCETrainer):
                         stop_action
                     ]
                     a_t[i] = 0
+            if mode != 'train' and 'terminal_commit_logits' in nav_outs:
+                commit_actions = nav_outs[
+                    'terminal_commit_logits'
+                ].argmax(dim=-1)
+                for i, commit_action in enumerate(commit_actions.tolist()):
+                    terminal_commit_vps[i] = nav_inputs['gmap_vp_ids'][i][
+                        commit_action
+                    ]
             cpu_a_t = a_t.cpu().numpy()
 
             # make equiv action
@@ -1030,6 +1049,8 @@ class RLTrainer(BaseVLNCETrainer):
             for i, gmap in enumerate(self.gmaps):
                 if cpu_a_t[i] == 0 or stepk == self.max_len - 1 or no_vp_left[i]: 
                     stop_vp = hindsight_stop_vps[i]
+                    if stop_vp is None:
+                        stop_vp = terminal_commit_vps[i]
                     if stop_vp is None:
                         # stop at node with max stop_prob
                         vp_stop_scores = [(vp, stop_score) for vp, stop_score in gmap.node_stop_scores.items()]
