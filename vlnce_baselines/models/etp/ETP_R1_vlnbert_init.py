@@ -56,6 +56,9 @@ def get_vlnbert_models(config=None, dropout_rate=0.1):
     vis_config.anchor_repair_hidden_size = getattr(
         config, 'anchor_repair_hidden_size', 0
     )
+    vis_config.hindsight_stop_hidden_size = getattr(
+        config, 'hindsight_stop_hidden_size', 0
+    )
 
     vis_config.num_l_layers = 12
     vis_config.num_pano_layers = 2
@@ -110,4 +113,10 @@ def get_vlnbert_models(config=None, dropout_rate=0.1):
     if visual_model.anchor_repair is not None and not has_anchor_repair:
         # from_pretrained reinitializes missing keys after model.__init__.
         visual_model.anchor_repair.reset_output()
+    has_hindsight_stop = any(
+        'hindsight_stop.' in key for key in new_ckpt_weights
+    )
+    if visual_model.hindsight_stop is not None and not has_hindsight_stop:
+        # from_pretrained reinitializes missing keys after model.__init__.
+        visual_model.hindsight_stop.reset_output()
     return visual_model

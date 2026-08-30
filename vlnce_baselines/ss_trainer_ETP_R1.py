@@ -987,6 +987,7 @@ class RLTrainer(BaseVLNCETrainer):
             nav_outs = self.policy.net(**nav_inputs)
             nav_logits = nav_outs['global_logits']
             nav_probs = F.softmax(nav_logits, 1)
+            hindsight_stop_vps = [None] * self.envs.num_envs
             stop_score_logits = nav_outs.get(
                 'base_global_logits', nav_logits
             )
@@ -1011,6 +1012,16 @@ class RLTrainer(BaseVLNCETrainer):
                 a_t = nav_logits.argmax(dim=-1)
             else:
                 raise NotImplementedError
+            if mode != 'train' and 'hindsight_stop_logits' in nav_outs:
+                stop_actions = nav_outs['hindsight_stop_logits'].argmax(dim=-1)
+                a_t = a_t.clone()
+                for i, stop_action in enumerate(stop_actions.tolist()):
+                    if stop_action == 0:
+                        continue
+                    hindsight_stop_vps[i] = nav_inputs['gmap_vp_ids'][i][
+                        stop_action
+                    ]
+                    a_t[i] = 0
             cpu_a_t = a_t.cpu().numpy()
 
             # make equiv action
@@ -1018,10 +1029,12 @@ class RLTrainer(BaseVLNCETrainer):
             use_tryout = (self.config.IL.tryout and not self.config.TASK_CONFIG.SIMULATOR.HABITAT_SIM_V0.ALLOW_SLIDING) 
             for i, gmap in enumerate(self.gmaps):
                 if cpu_a_t[i] == 0 or stepk == self.max_len - 1 or no_vp_left[i]: 
-                    # stop at node with max stop_prob
-                    vp_stop_scores = [(vp, stop_score) for vp, stop_score in gmap.node_stop_scores.items()]
-                    stop_scores = [s[1] for s in vp_stop_scores]
-                    stop_vp = vp_stop_scores[np.argmax(stop_scores)][0]
+                    stop_vp = hindsight_stop_vps[i]
+                    if stop_vp is None:
+                        # stop at node with max stop_prob
+                        vp_stop_scores = [(vp, stop_score) for vp, stop_score in gmap.node_stop_scores.items()]
+                        stop_scores = [s[1] for s in vp_stop_scores]
+                        stop_vp = vp_stop_scores[np.argmax(stop_scores)][0]
                     stop_pos = gmap.node_pos[stop_vp]
 
                     if self.config.IL.back_algo == 'control': 

@@ -43,6 +43,10 @@ from .utils import (
 )
 from vlnce_baselines.common.utils import dis_to_con, gather_list_and_concat
 from vlnce_baselines.anchor_relative import anchor_relative_advantages
+from vlnce_baselines.hindsight_stop import (
+    counterfactual_stop_returns,
+    hindsight_stop_targets,
+)
 from habitat_extensions.measures import NDTW, StepsTaken
 from fastdtw import fastdtw
 
@@ -298,13 +302,34 @@ class RLTrainer(BaseVLNCETrainer):
             anchor_repair_only = getattr(
                 self.config.GRPO, 'anchor_repair_only', False
             )
+            hindsight_stop_only = getattr(
+                self.config.GRPO, 'hindsight_stop_only', False
+            )
             if sum([
                     gauss_only, scorer_only, gaussian_bev_only,
-                    anchor_repair_only]) > 1:
+                    anchor_repair_only, hindsight_stop_only]) > 1:
                 raise ValueError(
                     'GRPO lightweight-only modes are mutually exclusive'
                 )
-            if anchor_repair_only:
+            if hindsight_stop_only:
+                hindsight_stop = vln_bert_module.hindsight_stop
+                if hindsight_stop is None:
+                    raise ValueError(
+                        'hindsight_stop_only requires '
+                        'MODEL.hindsight_stop_hidden_size > 0'
+                    )
+                if (self.config.GRPO.sample_num != 1 or
+                        self.config.MODEL.task_type != 'r2r' or
+                        self.config.MODEL.gauss_feat_size != 0 or
+                        self.config.MODEL.candidate_scorer_hidden_size != 0 or
+                        self.config.MODEL.gaussian_bev_hidden_size != 0 or
+                        self.config.MODEL.anchor_repair_hidden_size != 0):
+                    raise ValueError(
+                        'E6-1 requires R2R, sample_num=1, '
+                        'gauss_feat_size=0, and no E3/E4/E5 module'
+                    )
+                self.trainable_parts = [hindsight_stop]
+            elif anchor_repair_only:
                 anchor_repair = vln_bert_module.anchor_repair
                 if anchor_repair is None:
                     raise ValueError(
@@ -423,6 +448,18 @@ class RLTrainer(BaseVLNCETrainer):
                 raise RuntimeError(
                     'Anchor-repair GRPO expected only a sub-0.2M repair '
                     'module, got invalid=%s and %d parameters' %
+                    (invalid_names, trainable_count)
+                )
+        if getattr(self.config.GRPO, 'hindsight_stop_only', False):
+            trainable_count = sum(p.numel() for _, p in trainable_parameters)
+            invalid_names = [
+                name for name, _ in trainable_parameters
+                if '.hindsight_stop.' not in name
+            ]
+            if invalid_names or trainable_count >= 250000:
+                raise RuntimeError(
+                    'Hindsight-stop training expected only a sub-0.25M head, '
+                    'got invalid=%s and %d parameters' %
                     (invalid_names, trainable_count)
                 )
         no_decay = ['bias', 'LayerNorm.bias', 'LayerNorm.weight']
@@ -610,6 +647,35 @@ class RLTrainer(BaseVLNCETrainer):
                             sorted(missing_names)
                         )
                     vln_bert_module.anchor_repair.reset_output()
+            if getattr(self.config.GRPO, 'hindsight_stop_only', False):
+                invalid_missing = [
+                    key for key in incompatible_keys.missing_keys
+                    if '.hindsight_stop.' not in key
+                ]
+                if invalid_missing or incompatible_keys.unexpected_keys:
+                    raise RuntimeError(
+                        'E6 checkpoint mismatch: missing=%s, unexpected=%s' %
+                        (invalid_missing, incompatible_keys.unexpected_keys)
+                    )
+                stop_missing = [
+                    key for key in incompatible_keys.missing_keys
+                    if '.hindsight_stop.' in key
+                ]
+                if stop_missing:
+                    missing_names = {
+                        key.split('.hindsight_stop.', 1)[1]
+                        for key in stop_missing
+                    }
+                    expected_names = {
+                        name for name, _ in
+                        vln_bert_module.hindsight_stop.named_parameters()
+                    }
+                    if missing_names != expected_names:
+                        raise RuntimeError(
+                            'E6 checkpoint has a partial hindsight-stop head: %s' %
+                            sorted(missing_names)
+                        )
+                    vln_bert_module.hindsight_stop.reset_output()
 
             if config.GRPO.is_requeue:
                 self.optimizer.load_state_dict(ckpt_dict["optim_state"])
@@ -873,6 +939,10 @@ class RLTrainer(BaseVLNCETrainer):
             logger.info("Data buffer is empty. Skipping update.")
             return
 
+        if getattr(self.config.GRPO, 'hindsight_stop_only', False):
+            self._update_hindsight_stop()
+            return
+
         self.set_policy_mode("train")
 
         # --- 1. Pre-calculate advantages for all trajectories (done once for the entire buffer) ---
@@ -1104,6 +1174,137 @@ class RLTrainer(BaseVLNCETrainer):
         self.data_buffer.clear() 
         self.optimizer.zero_grad()
         self.scheduler.step()
+
+    def _update_hindsight_stop(self):
+        self.set_policy_mode("train")
+        sample = self.data_buffer[0]
+        steps = sample["data_buffer"]
+        if not steps:
+            logger.info("Hindsight-stop trajectory is empty. Skipping update.")
+            self.data_buffer.clear()
+            return
+
+        self.optimizer.zero_grad()
+        total_loss = 0.0
+        prediction_count = 0
+        rollback_count = 0
+        recovery_count = 0
+        regression_count = 0
+        stop_advantages = []
+
+        initial_txt_embeds = sample["initial_txt_embeds"].to(
+            self.device, non_blocking=True
+        )
+        initial_txt_masks = sample["initial_txt_masks"].to(
+            self.device, non_blocking=True
+        )
+        training_examples = sum(
+            len(step_data['indices']) for step_data in steps
+        )
+
+        for step_data in steps:
+            active_indices = step_data["indices"]
+            nav_inputs = {
+                key: value.to(self.device, non_blocking=True)
+                if isinstance(value, torch.Tensor) else value
+                for key, value in step_data["input"].items()
+            }
+            nav_inputs.update({
+                'txt_embeds': initial_txt_embeds[active_indices],
+                'txt_masks': initial_txt_masks[active_indices],
+                'mode': 'navigation',
+            })
+            outputs = self.policy.net(**nav_inputs)
+            logits = outputs['hindsight_stop_logits']
+            stop_returns = step_data['stop_returns'].to(
+                self.device, non_blocking=True
+            )
+            valid_mask = step_data['stop_valid_mask'].to(
+                self.device, non_blocking=True
+            )
+            continue_returns = torch.tensor(
+                [sample['reward'][index] for index in active_indices],
+                dtype=stop_returns.dtype,
+                device=self.device,
+            )
+            targets = hindsight_stop_targets(
+                stop_returns, continue_returns, valid_mask
+            )
+            loss = F.cross_entropy(
+                logits, targets, reduction='sum'
+            ) / training_examples
+            self.scaler.scale(loss).backward()
+            total_loss += loss.item()
+
+            with torch.no_grad():
+                predictions = logits.argmax(dim=1)
+                stop_success = step_data['stop_success'].to(
+                    self.device, non_blocking=True
+                )
+                rows = torch.arange(predictions.size(0), device=self.device)
+                predicted_success = stop_success[rows, predictions]
+                continue_success = torch.tensor(
+                    [sample['success'][index] for index in active_indices],
+                    dtype=torch.bool,
+                    device=self.device,
+                )
+                predicted_stop = predictions != 0
+                prediction_count += predictions.numel()
+                rollback_count += predicted_stop.sum().item()
+                recovery_count += (
+                    predicted_stop & predicted_success &
+                    continue_success.logical_not()
+                ).sum().item()
+                regression_count += (
+                    predicted_stop & predicted_success.logical_not() &
+                    continue_success
+                ).sum().item()
+                best_stop = stop_returns[:, 1:].max(dim=1).values
+                stop_advantages.extend(
+                    (best_stop - continue_returns).cpu().tolist()
+                )
+
+        self.scaler.unscale_(self.optimizer)
+        trainable_params = [
+            parameter for parameter in self.policy.parameters()
+            if parameter.requires_grad
+        ]
+        grad_norm = torch.nn.utils.clip_grad_norm_(
+            trainable_params, self.max_grad_norm
+        )
+        self.scaler.step(self.optimizer)
+        self.scaler.update()
+        self.scheduler.step()
+
+        final_success = [
+            value for value in sample['success'] if value is not None
+        ]
+        oracle_success = [
+            value for value in sample['oracle_success'] if value is not None
+        ]
+        self.logs['hindsight_stop_loss'].append(total_loss)
+        self.logs['total_loss'].append(total_loss)
+        self.logs['grad_norm'].append(grad_norm.item())
+        self.logs['rollback_rate'].append(
+            rollback_count / max(prediction_count, 1)
+        )
+        self.logs['stop_recoveries'].append(
+            recovery_count / max(prediction_count, 1)
+        )
+        self.logs['stop_regressions'].append(
+            regression_count / max(prediction_count, 1)
+        )
+        self.logs['counterfactual_stop_advantage'].append(
+            np.mean(stop_advantages) if stop_advantages else 0.0
+        )
+        if final_success and oracle_success:
+            self.logs['osr_sr_gap'].append(
+                np.mean(oracle_success) - np.mean(final_success)
+            )
+        self.logs['reward'].extend(sample['reward'])
+
+        self.data_buffer.clear()
+        self.optimizer.zero_grad()
     
     def get_pos_ori(self):
         pos_ori = self.envs.call(['get_pos_ori']*self.envs.num_envs)
@@ -1155,6 +1356,9 @@ class RLTrainer(BaseVLNCETrainer):
 
     def sample_once(self, initial_obs, use_base_policy=False):
         mode = 'train'
+        hindsight_stop_only = getattr(
+            self.config.GRPO, 'hindsight_stop_only', False
+        )
 
         instr_max_len = self.config.GRPO.max_text_len
         instr_pad_id = 1
@@ -1188,6 +1392,8 @@ class RLTrainer(BaseVLNCETrainer):
             "initial_txt_masks": all_txt_masks.detach().cpu(),
             "intervention_count": 0,
             "decision_count": 0,
+            "success": [None] * self.envs.num_envs,
+            "oracle_success": [None] * self.envs.num_envs,
         }
 
         total_actions = 0.
@@ -1203,6 +1409,9 @@ class RLTrainer(BaseVLNCETrainer):
                                    self.config.MODEL, 'gauss_feat_size', 0
                                )) for _ in range(self.envs.num_envs)]
         prev_vp = [None] * self.envs.num_envs
+        path_lengths = [0.0] * self.envs.num_envs
+        shortest_path_lengths = [None] * self.envs.num_envs
+        goal_distance_cache = [dict() for _ in range(self.envs.num_envs)]
 
         for stepk in range(self.max_len): 
             total_actions += self.envs.num_envs
@@ -1254,11 +1463,67 @@ class RLTrainer(BaseVLNCETrainer):
                                         cand_vp[i], cand_pos[i], cand_embeds,
                                         cand_real_pos[i])
 
+            if hindsight_stop_only:
+                for i, gmap in enumerate(self.gmaps):
+                    distance = self.envs.call_at(
+                        i, 'point_dist_to_goal',
+                        {'pos': gmap.node_pos[cur_vp[i]], 'is_train': True},
+                    )
+                    goal_distance_cache[i][cur_vp[i]] = distance
+                    if shortest_path_lengths[i] is None:
+                        shortest_path_lengths[i] = distance
+
             nav_inputs = self._nav_gmap_variable(cur_vp, cur_pos, cur_ori, task_type)
             nav_inputs.update({
                 'mode': 'navigation',
             })
             no_vp_left = nav_inputs.pop('no_vp_left') 
+
+            stop_returns = None
+            stop_success = None
+            stop_valid_mask = None
+            if hindsight_stop_only:
+                max_gmap_len = nav_inputs['gmap_step_ids'].size(1)
+                stop_returns = torch.full(
+                    (self.envs.num_envs, max_gmap_len),
+                    -float('inf'), dtype=torch.float32,
+                )
+                stop_success = torch.zeros(
+                    self.envs.num_envs, max_gmap_len, dtype=torch.bool
+                )
+                stop_valid_mask = (
+                    nav_inputs['gmap_masks'] &
+                    nav_inputs['gmap_visited_masks']
+                ).detach().cpu()
+                stop_valid_mask[:, 0] = True
+                success_distance = float(
+                    self.config.TASK_CONFIG.TASK.SUCCESS_DISTANCE
+                )
+                for i, gmap in enumerate(self.gmaps):
+                    node_vps = nav_inputs['gmap_vp_ids'][i][
+                        1:1 + len(gmap.node_pos)
+                    ]
+                    goal_distances = torch.tensor([
+                        goal_distance_cache[i][vp] for vp in node_vps
+                    ], dtype=torch.float32).unsqueeze(0)
+                    rollback_distances = torch.tensor([
+                        gmap.shortest_dist[cur_vp[i]][vp]
+                        for vp in node_vps
+                    ], dtype=torch.float32).unsqueeze(0)
+                    values = counterfactual_stop_returns(
+                        goal_distances,
+                        rollback_distances,
+                        path_length=torch.tensor([path_lengths[i]]),
+                        shortest_path_length=torch.tensor([
+                            shortest_path_lengths[i]
+                        ]),
+                        success_distance=success_distance,
+                        distance_scale=6.0,
+                    ).squeeze(0)
+                    stop_returns[i, 1:1 + len(node_vps)] = values
+                    stop_success[i, 1:1 + len(node_vps)] = (
+                        goal_distances.squeeze(0) <= success_distance
+                    )
 
             nav_inputs_for_gpu = nav_inputs.copy()
             nav_inputs_for_gpu['txt_embeds'] = txt_embeds
@@ -1282,7 +1547,7 @@ class RLTrainer(BaseVLNCETrainer):
                 )
 
             # determine action
-            if use_base_policy:
+            if hindsight_stop_only or use_base_policy:
                 a_t = nav_logits.argmax(dim=-1)
             else:
                 c = torch.distributions.Categorical(nav_probs)
@@ -1301,6 +1566,10 @@ class RLTrainer(BaseVLNCETrainer):
             data_this_stepk["action"] = a_t.detach().cpu() 
             data_this_stepk["probs"] = nav_probs.detach().cpu() 
             data_this_stepk["indices"] = copy.deepcopy(not_done_index) 
+            if hindsight_stop_only:
+                data_this_stepk["stop_returns"] = stop_returns
+                data_this_stepk["stop_success"] = stop_success
+                data_this_stepk["stop_valid_mask"] = stop_valid_mask
             data_this_sample['data_buffer'].append(data_this_stepk)
             # ------------------- end store data ------------------- 
 
@@ -1367,6 +1636,14 @@ class RLTrainer(BaseVLNCETrainer):
 
             outputs = self.envs.step(env_actions)
             observations, _, dones, infos = [list(x) for x in zip(*outputs)]
+            if hindsight_stop_only:
+                for i, info in enumerate(infos):
+                    prefix_path = np.asarray(
+                        info['position_train']['position']
+                    )
+                    path_lengths[i] = float(np.linalg.norm(
+                        prefix_path[1:] - prefix_path[:-1], axis=1
+                    ).sum())
 
             # calculate metric
             curr_eps = self.envs.current_episodes()
@@ -1381,13 +1658,24 @@ class RLTrainer(BaseVLNCETrainer):
                     metric = {}
                     metric['steps_taken'] = info['steps_taken']
                     metric['distance_to_goal'] = distances[-1]
-                    metric['success'] = 1. if distances[-1] <= 1.5 else 0.
-                    metric['oracle_success'] = 1. if (distances <= 1.5).any() else 0.
+                    success_distance = (
+                        float(self.config.TASK_CONFIG.TASK.SUCCESS_DISTANCE)
+                        if hindsight_stop_only else 1.5
+                    )
+                    metric['success'] = 1. if distances[-1] <= success_distance else 0.
+                    metric['oracle_success'] = 1. if (distances <= success_distance).any() else 0.
                     metric['path_length'] = float(np.linalg.norm(pred_path[1:] - pred_path[:-1],axis=1).sum())
                     gt_length = distances[0]
                     metric['spl'] = metric['success'] * gt_length / max(gt_length, metric['path_length'])
                     distance_to_goal_reward = 1 - 1 * (metric['distance_to_goal']) / 6
                     data_this_sample["reward"][not_done_index[i]] = metric['spl'] + metric['success'] + distance_to_goal_reward
+                    data_this_sample["success"][not_done_index[i]] = bool(
+                        metric['success']
+                    )
+                    data_this_sample["oracle_success"][not_done_index[i]] = any(
+                        distance <= success_distance
+                        for distance in goal_distance_cache[i].values()
+                    ) if hindsight_stop_only else bool(metric['oracle_success'])
                     self.logs['spl_reward'].append(metric['spl'])
                     self.logs['success_reward'].append(metric['success'])
                     self.logs['NE'].append(metric['distance_to_goal'])
@@ -1428,6 +1716,9 @@ class RLTrainer(BaseVLNCETrainer):
                         observations.pop(i)
                         self.gmaps.pop(i)
                         prev_vp.pop(i)
+                        path_lengths.pop(i)
+                        shortest_path_lengths.pop(i)
+                        goal_distance_cache.pop(i)
                         all_txt_ids = torch.cat((all_txt_ids[:i], all_txt_ids[i + 1:]), dim=0)
                         all_txt_task_encoding = torch.cat((all_txt_task_encoding[:i], all_txt_task_encoding[i + 1:]), dim=0)
                         all_txt_masks = torch.cat((all_txt_masks[:i], all_txt_masks[i + 1:]), dim=0)

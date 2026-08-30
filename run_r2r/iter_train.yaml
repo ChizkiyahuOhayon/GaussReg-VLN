@@ -101,6 +101,7 @@ GRPO:
   candidate_scorer_only: False
   gaussian_bev_only: False
   anchor_repair_only: False
+  hindsight_stop_only: False
 
   T_start: 2.0
   T_end: 1.0
@@ -121,6 +122,7 @@ MODEL:
   candidate_scorer_scale: 1.0
   gaussian_bev_hidden_size: 0
   anchor_repair_hidden_size: 0
+  hindsight_stop_hidden_size: 0
   merge_ghost: True
   consume_ghost: True
   

@@ -1049,6 +1049,70 @@ class AnchorRelativeRepair(nn.Module):
         repair_logits.scatter_(1, base_actions.unsqueeze(1), 0.0)
         return repair_logits
 
+
+class HindsightStopHead(nn.Module):
+    """Rank continuing E0 against stopping at an already visited node."""
+
+    def __init__(self, representation_size, hidden_size, layer_norm_eps):
+        super().__init__()
+        self.representation_norm = BertLayerNorm(
+            representation_size, eps=layer_norm_eps
+        )
+        self.hidden = nn.Linear(representation_size + 4, hidden_size)
+        self.output = nn.Linear(hidden_size, 1)
+
+    def reset_output(self):
+        nn.init.zeros_(self.output.weight)
+        nn.init.zeros_(self.output.bias)
+
+    def forward(
+        self, representations, base_stop_logits, step_ids, pair_distances,
+        valid_mask, visited_mask,
+    ):
+        if representations.shape[:2] != valid_mask.shape:
+            raise ValueError('Hindsight-stop representations and masks are misaligned')
+        if step_ids.shape != valid_mask.shape:
+            raise ValueError('Hindsight-stop step ids and masks are misaligned')
+        if visited_mask.shape != valid_mask.shape:
+            raise ValueError('Hindsight-stop visit and valid masks are misaligned')
+        if pair_distances.shape != (
+                valid_mask.size(0), valid_mask.size(1), valid_mask.size(1)):
+            raise ValueError('Hindsight-stop pair distances are misaligned')
+
+        stop_mask = valid_mask & visited_mask
+        stop_mask[:, 0] = valid_mask[:, 0]
+
+        normalized = self.representation_norm(representations.detach())
+        visited_steps = step_ids.masked_fill(visited_mask.logical_not(), -1)
+        current_indices = visited_steps.argmax(dim=1)
+        batch_indices = torch.arange(
+            representations.size(0), device=representations.device
+        )
+        current = normalized[batch_indices, current_indices].unsqueeze(1)
+        relative = normalized - current
+
+        max_steps = step_ids.max(dim=1, keepdim=True).values.clamp_min(1)
+        visit_time = step_ids.to(normalized.dtype) / max_steps.to(
+            normalized.dtype
+        )
+        graph_distance = pair_distances[
+            batch_indices, current_indices
+        ].to(normalized.dtype)
+        base_stop = base_stop_logits.detach().to(normalized.dtype).unsqueeze(1)
+        base_stop = base_stop.expand_as(visit_time)
+        is_continue = torch.zeros_like(visit_time)
+        is_continue[:, 0] = 1.0
+
+        inputs = torch.cat([
+            relative,
+            visit_time.unsqueeze(-1),
+            graph_distance.unsqueeze(-1),
+            base_stop.unsqueeze(-1),
+            is_continue.unsqueeze(-1),
+        ], dim=-1)
+        logits = self.output(gelu(self.hidden(inputs))).squeeze(-1)
+        return logits.masked_fill(stop_mask.logical_not(), -float('inf'))
+
 class GlocalTextPathNavCMT(BertPreTrainedModel): 
     def __init__(self, config):
         super().__init__(config)
@@ -1103,6 +1167,24 @@ class GlocalTextPathNavCMT(BertPreTrainedModel):
             )
         else:
             self.anchor_repair = None
+        hindsight_stop_hidden_size = getattr(
+            config, 'hindsight_stop_hidden_size', 0
+        )
+        if hindsight_stop_hidden_size > 0:
+            if (self.candidate_scorer is not None or
+                    self.gaussian_bev is not None or
+                    self.anchor_repair is not None):
+                raise ValueError(
+                    'hindsight_stop, anchor_repair, candidate_scorer, and '
+                    'gaussian_bev are mutually exclusive'
+                )
+            self.hindsight_stop = HindsightStopHead(
+                representation_size=config.hidden_size * 2,
+                hidden_size=hindsight_stop_hidden_size,
+                layer_norm_eps=config.layer_norm_eps,
+            )
+        else:
+            self.hindsight_stop = None
 
         self.init_weights()
         if self.global_encoder.gmap_gauss_embedding is not None:
@@ -1113,6 +1195,8 @@ class GlocalTextPathNavCMT(BertPreTrainedModel):
             self.gaussian_bev.reset_output()
         if self.anchor_repair is not None:
             self.anchor_repair.reset_output()
+        if self.hindsight_stop is not None:
+            self.hindsight_stop.reset_output()
         
         if config.fix_lang_embedding:
             print("FIX LANG EMBEDDING!!!!!!!!!!!!!!!!!!!!!!!!")
@@ -1219,10 +1303,19 @@ class GlocalTextPathNavCMT(BertPreTrainedModel):
                 gmap_masks, gmap_visited_masks,
             )
 
+        hindsight_stop_logits = None
+        if self.hindsight_stop is not None:
+            hindsight_stop_logits = self.hindsight_stop(
+                fusion_input, base_global_logits[:, 0], gmap_step_ids,
+                gmap_pair_dists, gmap_masks, gmap_visited_masks,
+            )
+
         outs = {
             'gmap_embeds': gmap_embeds, 
             'global_logits': global_logits
         }
-        if self.anchor_repair is not None:
+        if self.anchor_repair is not None or self.hindsight_stop is not None:
             outs['base_global_logits'] = base_global_logits
+        if hindsight_stop_logits is not None:
+            outs['hindsight_stop_logits'] = hindsight_stop_logits
         return outs

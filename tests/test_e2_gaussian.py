@@ -36,6 +36,22 @@ def test_e5_smoke_bootstraps_the_repository_root():
         sys.path[:] = original_path
 
 
+def test_e6_smoke_bootstraps_the_repository_root():
+    original_path = list(sys.path)
+    sys.path[:] = [
+        path for path in sys.path
+        if Path(path or '.').resolve() != REPO_ROOT
+    ]
+    try:
+        _load_module(
+            'smoke_e6_model_for_test',
+            REPO_ROOT / 'tools/smoke_e6_model.py',
+        )
+        assert sys.path[0] == str(REPO_ROOT)
+    finally:
+        sys.path[:] = original_path
+
+
 @pytest.fixture(scope='module')
 def graph_utils():
     habitat = types.ModuleType('habitat')
@@ -542,3 +558,87 @@ def test_gaussian_bev_out_of_range_candidate_falls_back_to_e0(vilmodel):
 
     assert residual.dtype == representations.dtype
     assert residual[0, 2].item() == 0.0
+
+
+def _new_hindsight_stop_head(module):
+    head = module.HindsightStopHead(
+        representation_size=1536,
+        hidden_size=128,
+        layer_norm_eps=1e-12,
+    )
+    head.reset_output()
+    return head
+
+
+def test_hindsight_stop_head_is_a_detached_continue_no_op(vilmodel):
+    head = _new_hindsight_stop_head(vilmodel)
+    representations = torch.randn(2, 5, 1536, requires_grad=True)
+    base_stop_logits = torch.tensor([0.5, -0.25])
+    step_ids = torch.tensor([
+        [0, 1, 2, 0, 0],
+        [0, 1, 2, 3, 0],
+    ])
+    pair_distances = torch.zeros(2, 5, 5)
+    pair_distances[0, 2, 1] = 0.2
+    pair_distances[1, 3, 1:3] = torch.tensor([0.4, 0.2])
+    valid_mask = torch.tensor([
+        [True, True, True, True, False],
+        [True, True, True, True, True],
+    ])
+    visited_mask = torch.tensor([
+        [False, True, True, False, False],
+        [False, True, True, True, False],
+    ])
+
+    logits = head(
+        representations, base_stop_logits, step_ids, pair_distances,
+        valid_mask, visited_mask,
+    )
+
+    assert logits.argmax(dim=-1).tolist() == [0, 0]
+    assert torch.isfinite(logits[:, 0]).all()
+    assert torch.isfinite(logits[0, 1:3]).all()
+    assert torch.isneginf(logits[0, 3:]).all()
+    assert torch.isfinite(logits[1, 1:4]).all()
+    assert torch.isneginf(logits[1, 4])
+    assert sum(parameter.numel() for parameter in head.parameters()) < 250000
+
+    logits[torch.isfinite(logits)].sum().backward()
+    assert representations.grad is None
+    assert torch.count_nonzero(head.output.weight.grad) > 0
+
+
+def test_counterfactual_stop_return_and_continue_target():
+    module = _load_module(
+        'hindsight_stop_for_test',
+        REPO_ROOT / 'vlnce_baselines/hindsight_stop.py',
+    )
+    goal_distances = torch.tensor([[4.0, 1.0, 2.0]])
+    rollback_distances = torch.tensor([[0.0, 2.0, 5.0]])
+
+    stop_returns = module.counterfactual_stop_returns(
+        goal_distances,
+        rollback_distances,
+        path_length=torch.tensor([5.0]),
+        shortest_path_length=torch.tensor([7.0]),
+        success_distance=3.0,
+        distance_scale=6.0,
+    )
+    valid_mask = torch.tensor([[True, True, True, False]])
+    returns = torch.cat([torch.zeros(1, 1), stop_returns], dim=1)
+
+    target = module.hindsight_stop_targets(
+        returns,
+        continue_returns=torch.tensor([2.9]),
+        valid_mask=valid_mask,
+    )
+    assert target.item() == 0
+
+    target = module.hindsight_stop_targets(
+        returns,
+        continue_returns=torch.tensor([2.5]),
+        valid_mask=valid_mask,
+    )
+    assert target.item() == 2
+    assert stop_returns[0, 1].item() == pytest.approx(17.0 / 6.0)
+    assert stop_returns[0, 2].item() < stop_returns[0, 1].item()
