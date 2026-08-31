@@ -46,6 +46,7 @@ from vlnce_baselines.anchor_relative import anchor_relative_advantages
 from vlnce_baselines.hindsight_stop import (
     counterfactual_stop_returns,
     hindsight_stop_targets,
+    success_set_nll,
 )
 from habitat_extensions.measures import NDTW, StepsTaken
 from fastdtw import fastdtw
@@ -308,6 +309,13 @@ class RLTrainer(BaseVLNCETrainer):
             terminal_commit_only = getattr(
                 self.config.GRPO, 'terminal_commit_only', False
             )
+            success_set_commit = getattr(
+                self.config.GRPO, 'success_set_commit', False
+            )
+            if success_set_commit and not terminal_commit_only:
+                raise ValueError(
+                    'success_set_commit requires terminal_commit_only'
+                )
             if sum([
                     gauss_only, scorer_only, gaussian_bev_only,
                     anchor_repair_only, hindsight_stop_only,
@@ -329,9 +337,10 @@ class RLTrainer(BaseVLNCETrainer):
                         self.config.MODEL.gaussian_bev_hidden_size != 0 or
                         self.config.MODEL.anchor_repair_hidden_size != 0 or
                         self.config.MODEL.hindsight_stop_hidden_size != 0):
+                    experiment = 'E8-1' if success_set_commit else 'E7-1'
                     raise ValueError(
-                        'E7-1 requires R2R, sample_num=1, '
-                        'gauss_feat_size=0, and no E3-E6 module'
+                        '%s requires R2R, sample_num=1, '
+                        'gauss_feat_size=0, and no E3-E6 module' % experiment
                     )
                 self.trainable_parts = [terminal_commit]
             elif hindsight_stop_only:
@@ -1389,6 +1398,11 @@ class RLTrainer(BaseVLNCETrainer):
         recoveries = 0
         regressions = 0
         reach_rewards = []
+        set_losses = []
+        success_set_sizes = []
+        use_success_set = getattr(
+            self.config.GRPO, 'success_set_commit', False
+        )
         initial_txt_embeds = sample["initial_txt_embeds"].to(
             self.device, non_blocking=True
         )
@@ -1414,15 +1428,25 @@ class RLTrainer(BaseVLNCETrainer):
             returns = example['returns'].to(
                 self.device, non_blocking=True
             )
-            target = returns.argmax(dim=1)
-            loss = F.cross_entropy(logits, target) / len(examples)
-            self.scaler.scale(loss).backward()
-            total_loss += loss.item()
+            success = example['success'].to(self.device)
+            if use_success_set:
+                loss = success_set_nll(logits, success)
+                if loss is not None:
+                    set_losses.append(loss)
+                    success_set_sizes.extend(
+                        (success & torch.isfinite(logits)).sum(
+                            dim=1
+                        ).cpu().tolist()
+                    )
+            else:
+                target = returns.argmax(dim=1)
+                loss = F.cross_entropy(logits, target) / len(examples)
+                self.scaler.scale(loss).backward()
+                total_loss += loss.item()
 
             with torch.no_grad():
                 prediction = logits.argmax(dim=1)
                 base_choice = example['base_choice'].to(self.device)
-                success = example['success'].to(self.device)
                 rows = torch.arange(prediction.size(0), device=self.device)
                 predicted_success = success[rows, prediction]
                 base_success = success[rows, base_choice]
@@ -1434,6 +1458,23 @@ class RLTrainer(BaseVLNCETrainer):
                     predicted_success.logical_not() & base_success
                 ).sum().item()
                 reach_rewards.extend(returns.max(dim=1).values.cpu().tolist())
+
+        if use_success_set:
+            if not set_losses:
+                logger.info(
+                    'Success-set trajectory has no recoverable terminal.'
+                )
+                self.optimizer.step()
+                self.scheduler.step()
+                self.logs['recoverable_terminal_rate'].append(0.0)
+                self.logs['success_set_size'].append(0.0)
+                self.logs['final_reward'].extend(sample['reward'])
+                self.data_buffer.clear()
+                self.optimizer.zero_grad()
+                return
+            loss = torch.stack(set_losses).mean()
+            self.scaler.scale(loss).backward()
+            total_loss = loss.item()
 
         self.scaler.unscale_(self.optimizer)
         trainable_params = [
@@ -1448,7 +1489,11 @@ class RLTrainer(BaseVLNCETrainer):
         self.scheduler.step()
 
         count = len(examples)
-        self.logs['terminal_commit_loss'].append(total_loss)
+        loss_name = (
+            'success_set_commit_loss' if use_success_set
+            else 'terminal_commit_loss'
+        )
+        self.logs[loss_name].append(total_loss)
         self.logs['total_loss'].append(total_loss)
         self.logs['grad_norm'].append(grad_norm.item())
         self.logs['terminal_reselection_rate'].append(reselections / count)
@@ -1456,6 +1501,13 @@ class RLTrainer(BaseVLNCETrainer):
         self.logs['terminal_regressions'].append(regressions / count)
         self.logs['reach_reward'].append(np.mean(reach_rewards))
         self.logs['final_reward'].extend(sample['reward'])
+        if use_success_set:
+            self.logs['recoverable_terminal_rate'].append(
+                len(set_losses) / count
+            )
+            self.logs['success_set_size'].append(
+                np.mean(success_set_sizes)
+            )
 
         self.data_buffer.clear()
         self.optimizer.zero_grad()

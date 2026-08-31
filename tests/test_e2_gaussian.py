@@ -68,6 +68,22 @@ def test_e7_smoke_bootstraps_the_repository_root():
         sys.path[:] = original_path
 
 
+def test_e8_smoke_bootstraps_the_repository_root():
+    original_path = list(sys.path)
+    sys.path[:] = [
+        path for path in sys.path
+        if Path(path or '.').resolve() != REPO_ROOT
+    ]
+    try:
+        _load_module(
+            'smoke_e8_model_for_test',
+            REPO_ROOT / 'tools/smoke_e8_model.py',
+        )
+        assert sys.path[0] == str(REPO_ROOT)
+    finally:
+        sys.path[:] = original_path
+
+
 @pytest.fixture(scope='module')
 def graph_utils():
     habitat = types.ModuleType('habitat')
@@ -729,3 +745,53 @@ def test_terminal_commit_return_charges_the_full_route_and_rollback():
 
     assert short_route.item() == pytest.approx(17.0 / 6.0)
     assert long_route.item() < short_route.item()
+
+
+def test_success_set_nll_matches_cross_entropy_for_one_positive():
+    module = _load_module(
+        'success_set_nll_for_test',
+        REPO_ROOT / 'vlnce_baselines/hindsight_stop.py',
+    )
+    logits = torch.tensor([[0.2, 1.1, -0.4]], requires_grad=True)
+    success = torch.tensor([[False, True, False]])
+
+    loss = module.success_set_nll(logits, success)
+
+    assert loss.item() == pytest.approx(
+        torch.nn.functional.cross_entropy(
+            logits, torch.tensor([1])
+        ).item()
+    )
+
+
+def test_success_set_nll_preserves_all_success_nodes():
+    module = _load_module(
+        'success_set_multiple_positives_for_test',
+        REPO_ROOT / 'vlnce_baselines/hindsight_stop.py',
+    )
+    logits = torch.tensor([[0.0, 1.0, 2.0]], requires_grad=True)
+    success = torch.tensor([[True, True, False]])
+
+    loss = module.success_set_nll(logits, success)
+    expected = torch.logsumexp(logits, dim=1) - torch.logsumexp(
+        logits[:, :2], dim=1
+    )
+
+    assert loss.item() == pytest.approx(expected.item())
+    loss.backward()
+    assert logits.grad[0, 0] < 0
+    assert logits.grad[0, 1] < 0
+    assert logits.grad[0, 2] > 0
+
+
+def test_success_set_nll_skips_trajectories_without_success():
+    module = _load_module(
+        'success_set_empty_for_test',
+        REPO_ROOT / 'vlnce_baselines/hindsight_stop.py',
+    )
+    logits = torch.tensor([[0.0, 1.0, -float('inf')]])
+    success = torch.zeros_like(logits, dtype=torch.bool)
+
+    assert module.success_set_nll(logits, success) is None
+    success[0, 2] = True
+    assert module.success_set_nll(logits, success) is None
