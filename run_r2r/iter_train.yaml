@@ -104,6 +104,7 @@ GRPO:
   hindsight_stop_only: False
   terminal_commit_only: False
   success_set_commit: False
+  setwise_group_policy: False
 
   T_start: 2.0
   T_end: 1.0

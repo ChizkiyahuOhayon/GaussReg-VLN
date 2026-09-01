@@ -48,6 +48,10 @@ from vlnce_baselines.hindsight_stop import (
     hindsight_stop_targets,
     success_set_nll,
 )
+from vlnce_baselines.setwise_policy import (
+    recoverable_outcome,
+    setwise_group_advantages,
+)
 from habitat_extensions.measures import NDTW, StepsTaken
 from fastdtw import fastdtw
 
@@ -312,10 +316,32 @@ class RLTrainer(BaseVLNCETrainer):
             success_set_commit = getattr(
                 self.config.GRPO, 'success_set_commit', False
             )
+            setwise_group_policy = getattr(
+                self.config.GRPO, 'setwise_group_policy', False
+            )
             if success_set_commit and not terminal_commit_only:
                 raise ValueError(
                     'success_set_commit requires terminal_commit_only'
                 )
+            if setwise_group_policy:
+                if any([
+                        gauss_only, scorer_only, gaussian_bev_only,
+                        anchor_repair_only, hindsight_stop_only,
+                        terminal_commit_only, success_set_commit]):
+                    raise ValueError(
+                        'E9 cannot use E2-E8 training modes'
+                    )
+                if (self.config.GRPO.sample_num != 8 or
+                        self.config.MODEL.task_type != 'r2r' or
+                        self.config.MODEL.gauss_feat_size != 0 or
+                        self.config.MODEL.candidate_scorer_hidden_size != 0 or
+                        self.config.MODEL.gaussian_bev_hidden_size != 0 or
+                        self.config.MODEL.anchor_repair_hidden_size != 0 or
+                        self.config.MODEL.hindsight_stop_hidden_size != 0 or
+                        self.config.MODEL.terminal_commit_hidden_size != 0):
+                    raise ValueError(
+                        'E9 requires R2R, sample_num=8, and no E2-E8 module'
+                    )
             if sum([
                     gauss_only, scorer_only, gaussian_bev_only,
                     anchor_repair_only, hindsight_stop_only,
@@ -1026,24 +1052,63 @@ class RLTrainer(BaseVLNCETrainer):
         anchor_repair_only = getattr(
             self.config.GRPO, 'anchor_repair_only', False
         )
+        setwise_group_policy = getattr(
+            self.config.GRPO, 'setwise_group_policy', False
+        )
         advantages_all_ep_all_samples = [[0.0] * self.initial_num_envs for _ in range(self.config.GRPO.sample_num)]
-        rewards_per_original_env_slot = [[] for _ in range(self.initial_num_envs)]
-
-        for s_idx in range(self.config.GRPO.sample_num):
-            for original_env_idx in range(self.initial_num_envs):
-                reward_val = self.data_buffer[s_idx]["reward"][original_env_idx]
-                if reward_val is not None:
-                    rewards_per_original_env_slot[original_env_idx].append(reward_val)
-
-        for original_env_idx in range(self.initial_num_envs):
-            rewards_for_this_slot = rewards_per_original_env_slot[original_env_idx]
-            if len(rewards_for_this_slot) > 1:
-                mean_r = np.mean(rewards_for_this_slot)
-                std_r = np.std(rewards_for_this_slot)
-                for s_idx in range(self.config.GRPO.sample_num):
-                    reward_val = self.data_buffer[s_idx]["reward"][original_env_idx]
+        setwise_active_groups = None
+        if setwise_group_policy:
+            outcomes = [
+                sample['setwise_outcome'] for sample in self.data_buffer
+            ]
+            advantages_all_ep_all_samples, setwise_active_groups = (
+                setwise_group_advantages(outcomes)
+            )
+            valid_outcomes = [
+                outcome for sample in outcomes for outcome in sample
+                if outcome is not None
+            ]
+            self.logs['setwise_active_group_rate'].append(
+                np.mean(setwise_active_groups)
+            )
+            self.logs['setwise_oracle_success'].append(
+                np.mean([outcome[0] for outcome in valid_outcomes])
+            )
+            self.logs['setwise_best_spl'].append(
+                np.mean([outcome[1] for outcome in valid_outcomes])
+            )
+            self.logs['setwise_min_distance'].append(
+                np.mean([outcome[2] for outcome in valid_outcomes])
+            )
+        else:
+            rewards_per_original_env_slot = [
+                [] for _ in range(self.initial_num_envs)
+            ]
+            for s_idx in range(self.config.GRPO.sample_num):
+                for original_env_idx in range(self.initial_num_envs):
+                    reward_val = self.data_buffer[s_idx]["reward"][
+                        original_env_idx
+                    ]
                     if reward_val is not None:
-                        advantages_all_ep_all_samples[s_idx][original_env_idx] = (reward_val - mean_r) / (std_r + 1e-8)
+                        rewards_per_original_env_slot[
+                            original_env_idx
+                        ].append(reward_val)
+
+            for original_env_idx in range(self.initial_num_envs):
+                rewards_for_this_slot = rewards_per_original_env_slot[
+                    original_env_idx
+                ]
+                if len(rewards_for_this_slot) > 1:
+                    mean_r = np.mean(rewards_for_this_slot)
+                    std_r = np.std(rewards_for_this_slot)
+                    for s_idx in range(self.config.GRPO.sample_num):
+                        reward_val = self.data_buffer[s_idx]["reward"][
+                            original_env_idx
+                        ]
+                        if reward_val is not None:
+                            advantages_all_ep_all_samples[s_idx][
+                                original_env_idx
+                            ] = (reward_val - mean_r) / (std_r + 1e-8)
 
         sample_indices = range(self.config.GRPO.sample_num)
         if anchor_repair_only:
@@ -1079,6 +1144,17 @@ class RLTrainer(BaseVLNCETrainer):
             self.logs['reward'].append(np.mean(all_spls_in_buffer))
         else:
             self.logs['reward'].append(0.0)
+
+        if (setwise_group_policy and
+                not any(setwise_active_groups)):
+            logger.info('All setwise groups are tied. Skipping update.')
+            self.logs['policy_loss'].append(0.0)
+            self.logs['kl_loss'].append(0.0)
+            self.logs['total_loss'].append(0.0)
+            self.data_buffer.clear()
+            self.optimizer.zero_grad()
+            self.scheduler.step()
+            return
 
         total_policy_loss_across_epochs = 0.0
         total_kl_loss_across_epochs = 0.0
@@ -1131,6 +1207,16 @@ class RLTrainer(BaseVLNCETrainer):
                             nav_inputs_cuda['mode'] = 'navigation' 
 
                             taken_actions_cuda = taken_actions_cpu.to(self.device)
+
+                            active_group_mask = None
+                            if setwise_group_policy:
+                                active_group_mask = torch.tensor(
+                                    [setwise_active_groups[index]
+                                     for index in active_indices_in_original_batch],
+                                    device=self.device, dtype=torch.bool,
+                                )
+                                if not active_group_mask.any():
+                                    continue
                     
                         current_policy_outputs = self.policy.net(**nav_inputs_cuda)
                         if self.need_ref_policy:
@@ -1141,15 +1227,33 @@ class RLTrainer(BaseVLNCETrainer):
                             current_logits = current_policy_outputs['global_logits']
                             current_log_probs = F.log_softmax(current_logits, dim=1)
                             current_log_probs_taken_action = current_log_probs.gather(1, taken_actions_cuda.unsqueeze(1)).squeeze(1)
+                            if active_group_mask is not None:
+                                current_log_probs_taken_action = (
+                                    current_log_probs_taken_action[
+                                        active_group_mask
+                                    ]
+                                )
                             if self.need_ref_policy:
                                 ref_logits = ref_policy_outputs['global_logits']
                                 ref_log_probs = F.log_softmax(ref_logits, dim=1)
                                 ref_log_probs_taken_action_no_grad = ref_log_probs.gather(1, taken_actions_cuda.unsqueeze(1)).squeeze(1)
+                                if active_group_mask is not None:
+                                    ref_log_probs_taken_action_no_grad = (
+                                        ref_log_probs_taken_action_no_grad[
+                                            active_group_mask
+                                        ]
+                                    )
 
                             step_advantages_for_active_envs = torch.tensor(
                                 [advantages_all_ep_all_samples[s_idx][orig_idx] for orig_idx in active_indices_in_original_batch],
                                 device=self.device, dtype=torch.float32
                             )
+                            if active_group_mask is not None:
+                                step_advantages_for_active_envs = (
+                                    step_advantages_for_active_envs[
+                                        active_group_mask
+                                    ]
+                                )
 
                             if self.grpo_update_epochs == -1:
                                 old_log_probs_taken_action = current_log_probs_taken_action.detach()
@@ -1157,6 +1261,12 @@ class RLTrainer(BaseVLNCETrainer):
                                 old_log_probs_taken_action = torch.log(
                                     old_probs_at_sampling_cpu.to(self.device).gather(1, taken_actions_cuda.unsqueeze(1)).squeeze(1) + 1e-9
                                 )
+                                if active_group_mask is not None:
+                                    old_log_probs_taken_action = (
+                                        old_log_probs_taken_action[
+                                            active_group_mask
+                                        ]
+                                    )
                             
                             ratio = torch.exp(current_log_probs_taken_action - old_log_probs_taken_action)
                             surr1 = ratio * step_advantages_for_active_envs
@@ -1568,6 +1678,9 @@ class RLTrainer(BaseVLNCETrainer):
         terminal_commit_only = getattr(
             self.config.GRPO, 'terminal_commit_only', False
         )
+        setwise_group_policy = getattr(
+            self.config.GRPO, 'setwise_group_policy', False
+        )
 
         instr_max_len = self.config.GRPO.max_text_len
         instr_pad_id = 1
@@ -1603,6 +1716,7 @@ class RLTrainer(BaseVLNCETrainer):
             "decision_count": 0,
             "success": [None] * self.envs.num_envs,
             "oracle_success": [None] * self.envs.num_envs,
+            "setwise_outcome": [None] * self.envs.num_envs,
             "terminal_examples": [],
         }
 
@@ -1941,7 +2055,8 @@ class RLTrainer(BaseVLNCETrainer):
                     metric['distance_to_goal'] = distances[-1]
                     success_distance = (
                         float(self.config.TASK_CONFIG.TASK.SUCCESS_DISTANCE)
-                        if (hindsight_stop_only or terminal_commit_only)
+                        if (hindsight_stop_only or terminal_commit_only or
+                            setwise_group_policy)
                         else 1.5
                     )
                     metric['success'] = 1. if distances[-1] <= success_distance else 0.
@@ -1958,6 +2073,12 @@ class RLTrainer(BaseVLNCETrainer):
                         distance <= success_distance
                         for distance in goal_distance_cache[i].values()
                     ) if (hindsight_stop_only or terminal_commit_only) else bool(metric['oracle_success'])
+                    if setwise_group_policy:
+                        data_this_sample["setwise_outcome"][
+                            not_done_index[i]
+                        ] = recoverable_outcome(
+                            pred_path, distances, success_distance
+                        )
                     self.logs['spl_reward'].append(metric['spl'])
                     self.logs['success_reward'].append(metric['success'])
                     self.logs['NE'].append(metric['distance_to_goal'])
