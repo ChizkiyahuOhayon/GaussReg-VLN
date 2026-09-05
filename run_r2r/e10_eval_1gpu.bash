@@ -1,6 +1,8 @@
 #!/bin/bash
 set -euo pipefail
 
+source "$(dirname "${BASH_SOURCE[0]}")/habitat_env.bash"
+
 export GLOG_minloglevel=2
 export MAGNUM_LOG=quiet
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-8}
