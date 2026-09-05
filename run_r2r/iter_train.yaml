@@ -105,6 +105,10 @@ GRPO:
   terminal_commit_only: False
   success_set_commit: False
   setwise_group_policy: False
+  frontier_advantage: False
+  frontier_advantage_start: 1.0
+  frontier_advantage_end: 0.25
+  frontier_progress_clip: 3.0
 
   T_start: 2.0
   T_end: 1.0

@@ -52,6 +52,11 @@ from vlnce_baselines.setwise_policy import (
     recoverable_outcome,
     setwise_group_advantages,
 )
+from vlnce_baselines.frontier_advantage import (
+    action_set_advantages,
+    annealed_weight,
+    mix_advantages,
+)
 from habitat_extensions.measures import NDTW, StepsTaken
 from fastdtw import fastdtw
 
@@ -92,6 +97,9 @@ class RLTrainer(BaseVLNCETrainer):
         self.enable_all_dropouts = config.GRPO.enable_all_dropouts
         self.dropout_in_sampling = config.GRPO.dropout_in_sampling
         self.dropout_rate = config.GRPO.dropout_rate
+        self.frontier_advantage = getattr(
+            config.GRPO, 'frontier_advantage', False
+        )
         self.scaler = GradScaler(enabled=self.enable_amp)
         print("config.GRPO:\n", config.GRPO)
         print(f"GRPO params: grpo_epsilon {self.grpo_epsilon}, grpo_beta {self.grpo_beta}, max_grad_norm {self.max_grad_norm}, grpo_update_epochs {self.grpo_update_epochs} \
@@ -319,6 +327,9 @@ class RLTrainer(BaseVLNCETrainer):
             setwise_group_policy = getattr(
                 self.config.GRPO, 'setwise_group_policy', False
             )
+            frontier_advantage = getattr(
+                self.config.GRPO, 'frontier_advantage', False
+            )
             if success_set_commit and not terminal_commit_only:
                 raise ValueError(
                     'success_set_commit requires terminal_commit_only'
@@ -327,7 +338,8 @@ class RLTrainer(BaseVLNCETrainer):
                 if any([
                         gauss_only, scorer_only, gaussian_bev_only,
                         anchor_repair_only, hindsight_stop_only,
-                        terminal_commit_only, success_set_commit]):
+                        terminal_commit_only, success_set_commit,
+                        frontier_advantage]):
                     raise ValueError(
                         'E9 cannot use E2-E8 training modes'
                     )
@@ -341,6 +353,24 @@ class RLTrainer(BaseVLNCETrainer):
                         self.config.MODEL.terminal_commit_hidden_size != 0):
                     raise ValueError(
                         'E9 requires R2R, sample_num=8, and no E2-E8 module'
+                    )
+            if frontier_advantage:
+                if any([
+                        gauss_only, scorer_only, gaussian_bev_only,
+                        anchor_repair_only, hindsight_stop_only,
+                        terminal_commit_only, success_set_commit,
+                        setwise_group_policy]):
+                    raise ValueError('E10 cannot use E2-E9 training modes')
+                if (self.config.GRPO.sample_num != 8 or
+                        self.config.MODEL.task_type != 'r2r' or
+                        self.config.MODEL.gauss_feat_size != 0 or
+                        self.config.MODEL.candidate_scorer_hidden_size != 0 or
+                        self.config.MODEL.gaussian_bev_hidden_size != 0 or
+                        self.config.MODEL.anchor_repair_hidden_size != 0 or
+                        self.config.MODEL.hindsight_stop_hidden_size != 0 or
+                        self.config.MODEL.terminal_commit_hidden_size != 0):
+                    raise ValueError(
+                        'E10 requires R2R, sample_num=8, and no E2-E8 module'
                     )
             if sum([
                     gauss_only, scorer_only, gaussian_bev_only,
@@ -775,6 +805,16 @@ class RLTrainer(BaseVLNCETrainer):
                             'head: %s' % sorted(missing_names)
                         )
                     vln_bert_module.terminal_commit.reset_output()
+            if frontier_advantage and (
+                    incompatible_keys.missing_keys or
+                    incompatible_keys.unexpected_keys):
+                raise RuntimeError(
+                    'E10 requires an exact E0 checkpoint: missing=%s, '
+                    'unexpected=%s' % (
+                        incompatible_keys.missing_keys,
+                        incompatible_keys.unexpected_keys,
+                    )
+                )
 
             if config.GRPO.is_requeue:
                 self.optimizer.load_state_dict(ckpt_dict["optim_state"])
@@ -966,6 +1006,7 @@ class RLTrainer(BaseVLNCETrainer):
         logger.info('Traning Starts... GOOD LUCK!')
         
         self.data_buffer = []
+        self.training_iteration = start_iter
         for idx in range(start_iter, total_iter, log_every):
             interval = min(log_every, max(total_iter-idx, 0)) 
             cur_iter = idx + interval 
@@ -1022,10 +1063,18 @@ class RLTrainer(BaseVLNCETrainer):
         self.logs = defaultdict(list)
 
         for idx in pbar:
+            if self.frontier_advantage:
+                self.frontier_advantage_weight = annealed_weight(
+                    self.config.GRPO.frontier_advantage_start,
+                    self.config.GRPO.frontier_advantage_end,
+                    self.training_iteration,
+                    self.config.GRPO.iters,
+                )
             with torch.no_grad():
                 with autocast(enabled=self.enable_amp):
                     self.sample_data(self.config.GRPO.sample_num)
             self.update()
+            self.training_iteration += 1
 
             if self.local_rank < 1:
                 pbar.set_postfix({'iter': f'{idx+1}/{interval}'})
@@ -1054,6 +1103,9 @@ class RLTrainer(BaseVLNCETrainer):
         )
         setwise_group_policy = getattr(
             self.config.GRPO, 'setwise_group_policy', False
+        )
+        frontier_advantage = getattr(
+            self.config.GRPO, 'frontier_advantage', False
         )
         advantages_all_ep_all_samples = [[0.0] * self.initial_num_envs for _ in range(self.config.GRPO.sample_num)]
         setwise_active_groups = None
@@ -1144,6 +1196,24 @@ class RLTrainer(BaseVLNCETrainer):
             self.logs['reward'].append(np.mean(all_spls_in_buffer))
         else:
             self.logs['reward'].append(0.0)
+
+        if frontier_advantage:
+            local_advantages = [
+                value.item()
+                for sample in self.data_buffer
+                for step in sample['data_buffer']
+                for value in step['frontier_advantage']
+            ]
+            self.logs['frontier_advantage'].append(
+                np.mean(local_advantages) if local_advantages else 0.0
+            )
+            self.logs['frontier_advantage_abs'].append(
+                np.mean(np.abs(local_advantages))
+                if local_advantages else 0.0
+            )
+            self.logs['frontier_advantage_weight'].append(
+                self.frontier_advantage_weight
+            )
 
         if (setwise_group_policy and
                 not any(setwise_active_groups)):
@@ -1253,6 +1323,19 @@ class RLTrainer(BaseVLNCETrainer):
                                     step_advantages_for_active_envs[
                                         active_group_mask
                                     ]
+                                )
+                            if frontier_advantage:
+                                local_advantages = step_data[
+                                    'frontier_advantage'
+                                ].to(self.device, non_blocking=True)
+                                if active_group_mask is not None:
+                                    local_advantages = local_advantages[
+                                        active_group_mask
+                                    ]
+                                step_advantages_for_active_envs = mix_advantages(
+                                    step_advantages_for_active_envs,
+                                    local_advantages,
+                                    self.frontier_advantage_weight,
                                 )
 
                             if self.grpo_update_epochs == -1:
@@ -1641,6 +1724,54 @@ class RLTrainer(BaseVLNCETrainer):
                 copied_dict[key] = copy.deepcopy(value) 
         return copied_dict
 
+    def _frontier_action_advantages(self, nav_inputs, cur_pos):
+        valid_mask = (
+            nav_inputs['gmap_masks'] &
+            nav_inputs['gmap_visited_masks'].logical_not()
+        ).detach().cpu()
+        candidate_distances = torch.full(
+            valid_mask.shape, float('inf'), dtype=torch.float32
+        )
+        current_distances = torch.full(
+            (valid_mask.size(0),), float('inf'), dtype=torch.float32
+        )
+
+        for i, gmap in enumerate(self.gmaps):
+            stop_vp = max(
+                gmap.node_stop_scores,
+                key=gmap.node_stop_scores.get,
+            )
+            action_indices = [0]
+            positions = [cur_pos[i], gmap.node_pos[stop_vp]]
+            for action_index in torch.nonzero(
+                    valid_mask[i, 1:], as_tuple=False).flatten().tolist():
+                action_index += 1
+                ghost_vp = nav_inputs['gmap_vp_ids'][i][action_index]
+                action_indices.append(action_index)
+                positions.append(gmap.ghost_aug_pos[ghost_vp])
+
+            distances = self.envs.call_at(
+                i,
+                'point_dists_to_goal',
+                {'positions': positions, 'is_train': True},
+            )
+            current_distances[i] = distances[0]
+            candidate_distances[i, action_indices] = torch.tensor(
+                distances[1:], dtype=torch.float32
+            )
+
+        return action_set_advantages(
+            current_distances,
+            candidate_distances,
+            valid_mask,
+            success_distance=float(
+                self.config.TASK_CONFIG.TASK.SUCCESS_DISTANCE
+            ),
+            progress_clip=float(
+                self.config.GRPO.frontier_progress_clip
+            ),
+        )
+
     def sample_data(self, sample_num):
         if not self.dropout_in_sampling:
             self.set_policy_mode("eval")
@@ -1680,6 +1811,9 @@ class RLTrainer(BaseVLNCETrainer):
         )
         setwise_group_policy = getattr(
             self.config.GRPO, 'setwise_group_policy', False
+        )
+        frontier_advantage = getattr(
+            self.config.GRPO, 'frontier_advantage', False
         )
 
         instr_max_len = self.config.GRPO.max_text_len
@@ -1894,6 +2028,23 @@ class RLTrainer(BaseVLNCETrainer):
                     data_this_sample['decision_count'] += a_t.numel()
             cpu_a_t = a_t.cpu().numpy()
 
+            chosen_frontier_advantages = None
+            if frontier_advantage:
+                if stepk == self.max_len - 1:
+                    chosen_frontier_advantages = torch.zeros(
+                        self.envs.num_envs, dtype=torch.float32
+                    )
+                else:
+                    frontier_advantages = self._frontier_action_advantages(
+                        nav_inputs, cur_pos
+                    )
+                    chosen_frontier_advantages = frontier_advantages.gather(
+                        1, a_t.detach().cpu().unsqueeze(1)
+                    ).squeeze(1)
+                    chosen_frontier_advantages[
+                        torch.tensor(no_vp_left, dtype=torch.bool)
+                    ] = 0.0
+
             if terminal_commit_only:
                 success_distance = float(
                     self.config.TASK_CONFIG.TASK.SUCCESS_DISTANCE
@@ -1960,6 +2111,10 @@ class RLTrainer(BaseVLNCETrainer):
             data_this_stepk["action"] = a_t.detach().cpu() 
             data_this_stepk["probs"] = nav_probs.detach().cpu() 
             data_this_stepk["indices"] = copy.deepcopy(not_done_index) 
+            if frontier_advantage:
+                data_this_stepk['frontier_advantage'] = (
+                    chosen_frontier_advantages
+                )
             if hindsight_stop_only:
                 data_this_stepk["stop_returns"] = stop_returns
                 data_this_stepk["stop_success"] = stop_success
@@ -2056,7 +2211,7 @@ class RLTrainer(BaseVLNCETrainer):
                     success_distance = (
                         float(self.config.TASK_CONFIG.TASK.SUCCESS_DISTANCE)
                         if (hindsight_stop_only or terminal_commit_only or
-                            setwise_group_policy)
+                            setwise_group_policy or frontier_advantage)
                         else 1.5
                     )
                     metric['success'] = 1. if distances[-1] <= success_distance else 0.

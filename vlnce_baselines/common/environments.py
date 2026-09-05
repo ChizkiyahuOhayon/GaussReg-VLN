@@ -127,6 +127,12 @@ class VLNCEDaggerEnv(habitat.RLEnv):
                 pos, self._env.current_episode.goals[-1].position,
             )
         return dist
+
+    def point_dists_to_goal(self, positions, is_train):
+        return [
+            self.point_dist_to_goal(position, is_train)
+            for position in positions
+        ]
     
     
     def get_cand_real_pos(self, forward, angle):
