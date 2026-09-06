@@ -106,6 +106,7 @@ GRPO:
   success_set_commit: False
   setwise_group_policy: False
   frontier_advantage: False
+  geo_token_only: False
   frontier_advantage_start: 1.0
   frontier_advantage_end: 0.25
   frontier_progress_clip: 3.0
@@ -131,6 +132,7 @@ MODEL:
   anchor_repair_hidden_size: 0
   hindsight_stop_hidden_size: 0
   terminal_commit_hidden_size: 0
+  geo_token_hidden_size: 0
   merge_ghost: True
   consume_ghost: True
   

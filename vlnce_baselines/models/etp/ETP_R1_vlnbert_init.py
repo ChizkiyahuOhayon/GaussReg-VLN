@@ -62,6 +62,9 @@ def get_vlnbert_models(config=None, dropout_rate=0.1):
     vis_config.terminal_commit_hidden_size = getattr(
         config, 'terminal_commit_hidden_size', 0
     )
+    vis_config.geo_token_hidden_size = getattr(
+        config, 'geo_token_hidden_size', 0
+    )
 
     vis_config.num_l_layers = 12
     vis_config.num_pano_layers = 2
@@ -128,4 +131,10 @@ def get_vlnbert_models(config=None, dropout_rate=0.1):
     if visual_model.terminal_commit is not None and not has_terminal_commit:
         # from_pretrained reinitializes missing keys after model.__init__.
         visual_model.terminal_commit.reset_output()
+    has_geo_token = any(
+        'geo_token.' in key for key in new_ckpt_weights
+    )
+    if visual_model.geo_token is not None and not has_geo_token:
+        # from_pretrained reinitializes missing keys after model.__init__.
+        visual_model.geo_token.reset_output()
     return visual_model

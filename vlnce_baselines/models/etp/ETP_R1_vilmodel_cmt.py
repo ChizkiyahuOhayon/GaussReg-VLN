@@ -17,6 +17,7 @@ from transformers import BertPreTrainedModel
 
 from vlnce_baselines.common.ops import create_transformer_encoder
 from vlnce_baselines.common.ops import extend_neg_masks, gen_seq_masks, pad_tensors_wgrad
+from vlnce_baselines.geo_token import GeoTokenResidual
 
 
 logger = logging.getLogger(__name__)
@@ -1263,6 +1264,20 @@ class GlocalTextPathNavCMT(BertPreTrainedModel):
             )
         else:
             self.terminal_commit = None
+        geo_token_hidden_size = getattr(config, 'geo_token_hidden_size', 0)
+        if geo_token_hidden_size > 0:
+            if any([
+                    self.candidate_scorer is not None,
+                    self.gaussian_bev is not None,
+                    self.anchor_repair is not None,
+                    self.hindsight_stop is not None,
+                    self.terminal_commit is not None]):
+                raise ValueError(
+                    'geo_token and E3-E8 modules are mutually exclusive'
+                )
+            self.geo_token = GeoTokenResidual(geo_token_hidden_size)
+        else:
+            self.geo_token = None
 
         self.init_weights()
         if self.global_encoder.gmap_gauss_embedding is not None:
@@ -1277,6 +1292,8 @@ class GlocalTextPathNavCMT(BertPreTrainedModel):
             self.hindsight_stop.reset_output()
         if self.terminal_commit is not None:
             self.terminal_commit.reset_output()
+        if self.geo_token is not None:
+            self.geo_token.reset_output()
         
         if config.fix_lang_embedding:
             print("FIX LANG EMBEDDING!!!!!!!!!!!!!!!!!!!!!!!!")
@@ -1336,6 +1353,7 @@ class GlocalTextPathNavCMT(BertPreTrainedModel):
         gmap_img_fts, gmap_pos_fts, 
         gmap_masks, gmap_visited_masks, gmap_pair_dists, gmap_task_embeddings,
         gmap_stop_scores=None,
+        gmap_geo_tokens=None, gmap_geo_masks=None,
     ):
         # global branch
         batch_size = gmap_task_embeddings.size(0)
@@ -1373,6 +1391,13 @@ class GlocalTextPathNavCMT(BertPreTrainedModel):
             global_logits = global_logits + self.gaussian_bev(
                 fusion_input, gmap_pos_fts, gmap_masks,
                 gmap_visited_masks,
+            )
+        if self.geo_token is not None:
+            if gmap_geo_tokens is None or gmap_geo_masks is None:
+                raise ValueError('geo_token requires aligned geometry inputs')
+            global_logits = global_logits + self.geo_token(
+                gmap_geo_tokens, gmap_geo_masks,
+                gmap_masks, gmap_visited_masks,
             )
         global_logits.masked_fill_(gmap_visited_masks, -float('inf'))
         global_logits.masked_fill_(gmap_masks.logical_not(), -float('inf'))

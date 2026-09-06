@@ -57,6 +57,7 @@ from vlnce_baselines.frontier_advantage import (
     annealed_weight,
     mix_advantages,
 )
+from vlnce_baselines.geo_token import align_candidate_tokens
 from habitat_extensions.measures import NDTW, StepsTaken
 from fastdtw import fastdtw
 
@@ -330,6 +331,9 @@ class RLTrainer(BaseVLNCETrainer):
             frontier_advantage = getattr(
                 self.config.GRPO, 'frontier_advantage', False
             )
+            geo_token_only = getattr(
+                self.config.GRPO, 'geo_token_only', False
+            )
             if success_set_commit and not terminal_commit_only:
                 raise ValueError(
                     'success_set_commit requires terminal_commit_only'
@@ -339,7 +343,7 @@ class RLTrainer(BaseVLNCETrainer):
                         gauss_only, scorer_only, gaussian_bev_only,
                         anchor_repair_only, hindsight_stop_only,
                         terminal_commit_only, success_set_commit,
-                        frontier_advantage]):
+                        frontier_advantage, geo_token_only]):
                     raise ValueError(
                         'E9 cannot use E2-E8 training modes'
                     )
@@ -350,7 +354,8 @@ class RLTrainer(BaseVLNCETrainer):
                         self.config.MODEL.gaussian_bev_hidden_size != 0 or
                         self.config.MODEL.anchor_repair_hidden_size != 0 or
                         self.config.MODEL.hindsight_stop_hidden_size != 0 or
-                        self.config.MODEL.terminal_commit_hidden_size != 0):
+                        self.config.MODEL.terminal_commit_hidden_size != 0 or
+                        self.config.MODEL.geo_token_hidden_size != 0):
                     raise ValueError(
                         'E9 requires R2R, sample_num=8, and no E2-E8 module'
                     )
@@ -359,7 +364,7 @@ class RLTrainer(BaseVLNCETrainer):
                         gauss_only, scorer_only, gaussian_bev_only,
                         anchor_repair_only, hindsight_stop_only,
                         terminal_commit_only, success_set_commit,
-                        setwise_group_policy]):
+                        setwise_group_policy, geo_token_only]):
                     raise ValueError('E10 cannot use E2-E9 training modes')
                 if (self.config.GRPO.sample_num != 8 or
                         self.config.MODEL.task_type != 'r2r' or
@@ -368,18 +373,40 @@ class RLTrainer(BaseVLNCETrainer):
                         self.config.MODEL.gaussian_bev_hidden_size != 0 or
                         self.config.MODEL.anchor_repair_hidden_size != 0 or
                         self.config.MODEL.hindsight_stop_hidden_size != 0 or
-                        self.config.MODEL.terminal_commit_hidden_size != 0):
+                        self.config.MODEL.terminal_commit_hidden_size != 0 or
+                        self.config.MODEL.geo_token_hidden_size != 0):
                     raise ValueError(
                         'E10 requires R2R, sample_num=8, and no E2-E8 module'
                     )
             if sum([
                     gauss_only, scorer_only, gaussian_bev_only,
                     anchor_repair_only, hindsight_stop_only,
-                    terminal_commit_only]) > 1:
+                    terminal_commit_only, geo_token_only]) > 1:
                 raise ValueError(
                     'GRPO lightweight-only modes are mutually exclusive'
                 )
-            if terminal_commit_only:
+            if geo_token_only:
+                geo_token = vln_bert_module.geo_token
+                if geo_token is None:
+                    raise ValueError(
+                        'geo_token_only requires '
+                        'MODEL.geo_token_hidden_size > 0'
+                    )
+                if (self.config.GRPO.sample_num != 8 or
+                        self.config.MODEL.task_type != 'r2r' or
+                        self.config.MODEL.gauss_feat_size != 0 or
+                        self.config.MODEL.candidate_scorer_hidden_size != 0 or
+                        self.config.MODEL.gaussian_bev_hidden_size != 0 or
+                        self.config.MODEL.anchor_repair_hidden_size != 0 or
+                        self.config.MODEL.hindsight_stop_hidden_size != 0 or
+                        self.config.MODEL.terminal_commit_hidden_size != 0 or
+                        setwise_group_policy or frontier_advantage):
+                    raise ValueError(
+                        'E11 requires strict E0, R2R, sample_num=8, and '
+                        'no E2-E10 module'
+                    )
+                self.trainable_parts = [geo_token]
+            elif terminal_commit_only:
                 terminal_commit = vln_bert_module.terminal_commit
                 if terminal_commit is None:
                     raise ValueError(
@@ -560,6 +587,18 @@ class RLTrainer(BaseVLNCETrainer):
                 raise RuntimeError(
                     'Terminal-commit training expected only a sub-0.25M head, '
                     'got invalid=%s and %d parameters' %
+                    (invalid_names, trainable_count)
+                )
+        if getattr(self.config.GRPO, 'geo_token_only', False):
+            trainable_count = sum(p.numel() for _, p in trainable_parameters)
+            invalid_names = [
+                name for name, _ in trainable_parameters
+                if '.geo_token.' not in name
+            ]
+            if invalid_names or trainable_count != 1857:
+                raise RuntimeError(
+                    'GeoToken training expected exactly 1,857 GeoToken '
+                    'parameters, got invalid=%s and %d parameters' %
                     (invalid_names, trainable_count)
                 )
         no_decay = ['bias', 'LayerNorm.bias', 'LayerNorm.weight']
@@ -805,6 +844,35 @@ class RLTrainer(BaseVLNCETrainer):
                             'head: %s' % sorted(missing_names)
                         )
                     vln_bert_module.terminal_commit.reset_output()
+            if getattr(self.config.GRPO, 'geo_token_only', False):
+                invalid_missing = [
+                    key for key in incompatible_keys.missing_keys
+                    if '.geo_token.' not in key
+                ]
+                if invalid_missing or incompatible_keys.unexpected_keys:
+                    raise RuntimeError(
+                        'E11 checkpoint mismatch: missing=%s, unexpected=%s' %
+                        (invalid_missing, incompatible_keys.unexpected_keys)
+                    )
+                token_missing = [
+                    key for key in incompatible_keys.missing_keys
+                    if '.geo_token.' in key
+                ]
+                if token_missing:
+                    missing_names = {
+                        key.split('.geo_token.', 1)[1]
+                        for key in token_missing
+                    }
+                    expected_names = {
+                        name for name, _ in
+                        vln_bert_module.geo_token.named_parameters()
+                    }
+                    if missing_names != expected_names:
+                        raise RuntimeError(
+                            'E11 checkpoint has a partial GeoToken module: %s' %
+                            sorted(missing_names)
+                        )
+                    vln_bert_module.geo_token.reset_output()
             if frontier_advantage and (
                     incompatible_keys.missing_keys or
                     incompatible_keys.unexpected_keys):
@@ -1913,13 +1981,16 @@ class RLTrainer(BaseVLNCETrainer):
             else:
                 cand_real_pos = [None] * self.envs.num_envs
 
+            candidate_targets = []
             for i in range(self.envs.num_envs):
                 cur_embeds = avg_pano_embeds[i]
                 cand_embeds = pano_embeds[i][vp_inputs['nav_types'][i]==1] 
-                self.gmaps[i].update_graph(prev_vp[i], stepk+1,
-                                        cur_vp[i], cur_pos[i], cur_embeds,
-                                        cand_vp[i], cand_pos[i], cand_embeds,
-                                        cand_real_pos[i])
+                candidate_targets.append(self.gmaps[i].update_graph(
+                    prev_vp[i], stepk+1,
+                    cur_vp[i], cur_pos[i], cur_embeds,
+                    cand_vp[i], cand_pos[i], cand_embeds,
+                    cand_real_pos[i],
+                ))
 
             if hindsight_stop_only or terminal_commit_only:
                 for i, gmap in enumerate(self.gmaps):
@@ -1932,6 +2003,14 @@ class RLTrainer(BaseVLNCETrainer):
                         shortest_path_lengths[i] = distance
 
             nav_inputs = self._nav_gmap_variable(cur_vp, cur_pos, cur_ori, task_type)
+            if 'cand_geo_tokens' in wp_outputs:
+                geo_tokens, geo_masks = align_candidate_tokens(
+                    nav_inputs['gmap_vp_ids'], candidate_targets,
+                    wp_outputs['cand_geo_tokens'],
+                    wp_outputs['cand_geo_masks'],
+                )
+                nav_inputs['gmap_geo_tokens'] = geo_tokens
+                nav_inputs['gmap_geo_masks'] = geo_masks
             nav_inputs.update({
                 'mode': 'navigation',
             })

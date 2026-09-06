@@ -42,6 +42,7 @@ from .utils import (
     length2mask, dir_angle_feature_with_ele,
 )
 from vlnce_baselines.common.utils import dis_to_con, gather_list_and_concat
+from vlnce_baselines.geo_token import align_candidate_tokens
 from habitat_extensions.measures import NDTW, StepsTaken
 from fastdtw import fastdtw
 
@@ -969,15 +970,26 @@ class RLTrainer(BaseVLNCETrainer):
             else:
                 cand_real_pos = [None] * self.envs.num_envs
 
+            candidate_targets = []
             for i in range(self.envs.num_envs):
                 cur_embeds = avg_pano_embeds[i]
                 cand_embeds = pano_embeds[i][vp_inputs['nav_types'][i]==1] 
-                self.gmaps[i].update_graph(prev_vp[i], stepk+1,
-                                        cur_vp[i], cur_pos[i], cur_embeds,
-                                        cand_vp[i], cand_pos[i], cand_embeds,
-                                        cand_real_pos[i])
+                candidate_targets.append(self.gmaps[i].update_graph(
+                    prev_vp[i], stepk+1,
+                    cur_vp[i], cur_pos[i], cur_embeds,
+                    cand_vp[i], cand_pos[i], cand_embeds,
+                    cand_real_pos[i],
+                ))
 
             nav_inputs = self._nav_gmap_variable(cur_vp, cur_pos, cur_ori, task_type)
+            if 'cand_geo_tokens' in wp_outputs:
+                geo_tokens, geo_masks = align_candidate_tokens(
+                    nav_inputs['gmap_vp_ids'], candidate_targets,
+                    wp_outputs['cand_geo_tokens'],
+                    wp_outputs['cand_geo_masks'],
+                )
+                nav_inputs['gmap_geo_tokens'] = geo_tokens
+                nav_inputs['gmap_geo_masks'] = geo_masks
             nav_inputs.update({
                 'mode': 'navigation',
                 'txt_embeds': txt_embeds, 

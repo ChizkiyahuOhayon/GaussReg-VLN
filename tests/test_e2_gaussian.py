@@ -84,6 +84,22 @@ def test_e8_smoke_bootstraps_the_repository_root():
         sys.path[:] = original_path
 
 
+def test_e11_smoke_bootstraps_the_repository_root():
+    original_path = list(sys.path)
+    sys.path[:] = [
+        path for path in sys.path
+        if Path(path or '.').resolve() != REPO_ROOT
+    ]
+    try:
+        _load_module(
+            'smoke_e11_model_for_test',
+            REPO_ROOT / 'tools/smoke_e11_model.py',
+        )
+        assert sys.path[0] == str(REPO_ROOT)
+    finally:
+        sys.path[:] = original_path
+
+
 @pytest.fixture(scope='module')
 def graph_utils():
     habitat = types.ModuleType('habitat')
@@ -138,12 +154,17 @@ def vilmodel():
     ops.extend_neg_masks = lambda masks: masks
     ops.gen_seq_masks = lambda lengths: lengths
     ops.pad_tensors_wgrad = lambda tensors: tensors
+    geo_token = _load_module(
+        'geo_token_for_vilmodel_test',
+        REPO_ROOT / 'vlnce_baselines/geo_token.py',
+    )
 
     modules = {
         'transformers': transformers,
         'vlnce_baselines': package,
         'vlnce_baselines.common': common,
         'vlnce_baselines.common.ops': ops,
+        'vlnce_baselines.geo_token': geo_token,
     }
     previous = {name: sys.modules.get(name) for name in modules}
     sys.modules.update(modules)

@@ -29,6 +29,7 @@ from vlnce_baselines.waypoint_pred.TRM_net import BinaryDistPredictor_TRM
 from vlnce_baselines.waypoint_pred.utils import nms
 from vlnce_baselines.models.utils import (
     angle_feature_with_ele, dir_angle_feature_with_ele, angle_feature_torch, length2mask)
+from vlnce_baselines.geo_token import gaussian_free_space_tokens
 import math
 
 @baseline_registry.register_policy
@@ -90,6 +91,9 @@ class ETP(Net):
             else torch.device("cpu")
         )
         self.device = device
+        self.geo_token_enabled = (
+            getattr(model_config, 'geo_token_hidden_size', 0) > 0
+        )
 
         print('\nInitalizing the ETP model ...')
         self.vln_bert = get_vlnbert_models(config=model_config, dropout_rate=dropout_rate)
@@ -165,7 +169,8 @@ class ETP(Net):
                 gmap_vp_ids=None, gmap_step_ids=None,
                 gmap_img_fts=None, gmap_pos_fts=None,
                 gmap_masks=None, gmap_visited_masks=None, gmap_pair_dists=None,
-                gmap_task_embeddings=None, gmap_stop_scores=None):
+                gmap_task_embeddings=None, gmap_stop_scores=None,
+                gmap_geo_tokens=None, gmap_geo_masks=None):
 
         if mode == 'language':
             encoded_sentence = self.vln_bert.forward_txt(
@@ -212,8 +217,16 @@ class ETP(Net):
                 torch.flip(rgb_embed_reshape[:,1:,:], [1]),
             ), dim=1)
             depth_feats = torch.cat((
-                depth_embed_reshape[:,0:1,:], 
+                depth_embed_reshape[:,0:1,:],
                 torch.flip(depth_embed_reshape[:,1:,:], [1]),
+            ), dim=1)
+            depth_maps = depth_batch.view(
+                batch_size, NUM_IMGS,
+                depth_batch.size(1), depth_batch.size(2),
+            )
+            depth_maps = torch.cat((
+                depth_maps[:, 0:1],
+                torch.flip(depth_maps[:, 1:], [1]),
             ), dim=1)
             # way_feats = torch.cat((
             #     way_feats[:,0:1,:], 
@@ -300,6 +313,8 @@ class ETP(Net):
             cand_img_idxes = []
             cand_angles = []
             cand_distances = []
+            cand_geo_tokens = []
+            cand_geo_masks = []
             for j in range(batch_size):
                 if in_train:
                     angle_idxes = torch.tensor(batch_sample_angle_idxes[j])
@@ -320,6 +335,29 @@ class ETP(Net):
                 # for rgb & depth
                 cand_rgb.append(rgb_feats[j, img_idxes, ...])
                 cand_depth.append(depth_feats[j, img_idxes, ...])
+                if self.geo_token_enabled:
+                    image_indices = torch.as_tensor(
+                        img_idxes, device=depth_maps.device, dtype=torch.long
+                    )
+                    candidate_headings = angle_rad_cc.to(
+                        device=depth_maps.device
+                    )
+                    view_headings = image_indices.float() * (
+                        2 * math.pi / NUM_IMGS
+                    )
+                    heading_offsets = torch.atan2(
+                        torch.sin(candidate_headings - view_headings),
+                        torch.cos(candidate_headings - view_headings),
+                    )
+                    geo_tokens, geo_masks = gaussian_free_space_tokens(
+                        depth_maps[j, image_indices],
+                        heading_offsets,
+                        ((distance_idxes + 1) * 0.25).to(
+                            device=depth_maps.device
+                        ),
+                    )
+                    cand_geo_tokens.append(geo_tokens)
+                    cand_geo_masks.append(geo_masks)
             
             # for pano
             pano_rgb = rgb_feats                            # B x 12 x 2048
@@ -341,8 +379,11 @@ class ETP(Net):
                 'pano_rgb': pano_rgb,               # B x 12 x 2048
                 'pano_depth': pano_depth,           # B x 12 x 128
                 'pano_angle_fts': pano_angle_fts,   # 12 x 4
-                'pano_img_idxes': pano_img_idxes,   # 12 
+                'pano_img_idxes': pano_img_idxes,   # 12
             }
+            if self.geo_token_enabled:
+                outputs['cand_geo_tokens'] = cand_geo_tokens
+                outputs['cand_geo_masks'] = cand_geo_masks
             
             return outputs
 
@@ -360,6 +401,7 @@ class ETP(Net):
                 gmap_img_fts, gmap_pos_fts,
                 gmap_masks, gmap_visited_masks, gmap_pair_dists,
                 gmap_task_embeddings, gmap_stop_scores,
+                gmap_geo_tokens, gmap_geo_masks,
             )
             return outs
 
