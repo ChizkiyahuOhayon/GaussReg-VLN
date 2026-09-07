@@ -43,6 +43,10 @@ from .utils import (
 )
 from vlnce_baselines.common.utils import dis_to_con, gather_list_and_concat
 from vlnce_baselines.geo_token import align_candidate_tokens
+from vlnce_baselines.instruction_coverage import (
+    NUM_INSTRUCTION_SLOTS,
+    aggregate_view_evidence,
+)
 from habitat_extensions.measures import NDTW, StepsTaken
 from fastdtw import fastdtw
 
@@ -287,9 +291,13 @@ class RLTrainer(BaseVLNCETrainer):
                 incompatible_keys = self.policy.load_state_dict(new_state_dict, strict=False)
             else:
                 incompatible_keys = self.policy.load_state_dict(ckpt_dict["state_dict"], strict=False)
-            if getattr(config.MODEL, 'successor_hidden_size', 0) and (
+            exact_experiment_checkpoint = (
+                getattr(config.MODEL, 'successor_hidden_size', 0) or
+                getattr(config.MODEL, 'instruction_coverage_hidden_size', 0)
+            )
+            if exact_experiment_checkpoint and (
                     incompatible_keys.missing_keys or incompatible_keys.unexpected_keys):
-                raise RuntimeError('E12 evaluation requires an exact complete checkpoint: %s' %
+                raise RuntimeError('Experiment evaluation requires an exact complete checkpoint: %s' %
                                    str(incompatible_keys))
             
             if self.local_rank < 1:
@@ -422,6 +430,7 @@ class RLTrainer(BaseVLNCETrainer):
         batch_gmap_vp_ids, batch_gmap_step_ids, batch_gmap_lens = [], [], []
         batch_gmap_img_fts, batch_gmap_pos_fts = [], []
         batch_gmap_pair_dists, batch_gmap_visited_masks = [], []
+        batch_gmap_instruction_evidence = []
         batch_no_vp_left = []
         batch_gmap_task_embeddings = []
 
@@ -473,6 +482,14 @@ class RLTrainer(BaseVLNCETrainer):
             batch_gmap_pos_fts.append(torch.from_numpy(gmap_pos_fts))
             batch_gmap_pair_dists.append(torch.from_numpy(gmap_pair_dists))
             batch_gmap_visited_masks.append(torch.BoolTensor(gmap_visited_masks))
+            if gmap.instruction_evidence_size:
+                instruction_evidence = [
+                    gmap.get_instruction_evidence(vp)
+                    for vp in node_vp_ids + ghost_vp_ids
+                ]
+                batch_gmap_instruction_evidence.append(torch.stack([
+                    torch.zeros_like(instruction_evidence[0])
+                ] + instruction_evidence))
         
         batch_gmap_step_ids = pad_sequence(batch_gmap_step_ids, batch_first=True).cuda()
         batch_gmap_task_embeddings = pad_sequence(batch_gmap_task_embeddings, batch_first=True).cuda()
@@ -489,12 +506,17 @@ class RLTrainer(BaseVLNCETrainer):
             gmap_pair_dists[i, :batch_gmap_lens[i], :batch_gmap_lens[i]] = batch_gmap_pair_dists[i]
         gmap_pair_dists = gmap_pair_dists.cuda()
 
-        return {
+        outputs = {
             'gmap_vp_ids': batch_gmap_vp_ids, 'gmap_step_ids': batch_gmap_step_ids,
             'gmap_img_fts': batch_gmap_img_fts, 'gmap_pos_fts': batch_gmap_pos_fts, 
             'gmap_masks': batch_gmap_masks, 'gmap_visited_masks': batch_gmap_visited_masks, 'gmap_pair_dists': gmap_pair_dists,
             'no_vp_left': batch_no_vp_left, 'gmap_task_embeddings': batch_gmap_task_embeddings
         }
+        if batch_gmap_instruction_evidence:
+            outputs['gmap_instruction_evidence'] = pad_tensors_wgrad(
+                batch_gmap_instruction_evidence
+            )
+        return outputs
 
     def _history_variable(self, obs):
         batch_size = obs['pano_rgb'].shape[0]
@@ -929,6 +951,13 @@ class RLTrainer(BaseVLNCETrainer):
                                ghost_aug,
                                gauss_feat_size=getattr(
                                    self.config.MODEL, 'gauss_feat_size', 0
+                               ),
+                               instruction_evidence_size=(
+                                   NUM_INSTRUCTION_SLOTS
+                                   if getattr(
+                                       self.config.MODEL,
+                                       'instruction_coverage_hidden_size', 0
+                                   ) > 0 else 0
                                )) for _ in range(self.envs.num_envs)]
         prev_vp = [None] * self.envs.num_envs
 
@@ -952,6 +981,21 @@ class RLTrainer(BaseVLNCETrainer):
             pano_embeds, pano_masks = self.policy.net(**vp_inputs)
             avg_pano_embeds = torch.sum(pano_embeds * pano_masks.unsqueeze(2), 1) / \
                               torch.sum(pano_masks, 1, keepdim=True)
+            pano_instruction_evidence = None
+            current_instruction_evidence = None
+            if getattr(
+                    self.config.MODEL,
+                    'instruction_coverage_hidden_size', 0) > 0:
+                pano_instruction_evidence, _ = self.policy.net(
+                    mode='instruction_evidence',
+                    view_embeds=pano_embeds,
+                    view_masks=pano_masks,
+                    txt_embeds=txt_embeds,
+                    txt_masks=txt_masks,
+                )
+                current_instruction_evidence = aggregate_view_evidence(
+                    pano_instruction_evidence, pano_masks
+                )
 
             cur_pos, cur_ori = self.get_pos_ori()
             cur_vp, cand_vp, cand_pos = [], [], []
@@ -978,11 +1022,21 @@ class RLTrainer(BaseVLNCETrainer):
             for i in range(self.envs.num_envs):
                 cur_embeds = avg_pano_embeds[i]
                 cand_embeds = pano_embeds[i][vp_inputs['nav_types'][i]==1] 
+                cand_instruction_evidence = (
+                    pano_instruction_evidence[i][
+                        vp_inputs['nav_types'][i] == 1
+                    ] if pano_instruction_evidence is not None else None
+                )
                 candidate_targets.append(self.gmaps[i].update_graph(
                     prev_vp[i], stepk+1,
                     cur_vp[i], cur_pos[i], cur_embeds,
                     cand_vp[i], cand_pos[i], cand_embeds,
                     cand_real_pos[i],
+                    cur_instruction_evidence=(
+                        current_instruction_evidence[i]
+                        if current_instruction_evidence is not None else None
+                    ),
+                    cand_instruction_evidence=cand_instruction_evidence,
                 ))
 
             nav_inputs = self._nav_gmap_variable(cur_vp, cur_pos, cur_ori, task_type)

@@ -58,6 +58,10 @@ from vlnce_baselines.frontier_advantage import (
     mix_advantages,
 )
 from vlnce_baselines.geo_token import align_candidate_tokens
+from vlnce_baselines.instruction_coverage import (
+    NUM_INSTRUCTION_SLOTS,
+    aggregate_view_evidence,
+)
 from habitat_extensions.measures import NDTW, StepsTaken
 from fastdtw import fastdtw
 
@@ -104,6 +108,10 @@ class RLTrainer(BaseVLNCETrainer):
         self.frontier_advantage = getattr(
             config.GRPO, 'frontier_advantage', False
         )
+        self.instruction_coverage_only = getattr(
+            config.GRPO, 'instruction_coverage_only', False
+        )
+        self.e13_optimizer_updates = 0
         self.scaler = GradScaler(enabled=self.enable_amp)
         print("config.GRPO:\n", config.GRPO)
         print(f"GRPO params: grpo_epsilon {self.grpo_epsilon}, grpo_beta {self.grpo_beta}, max_grad_norm {self.max_grad_norm}, grpo_update_epochs {self.grpo_update_epochs} \
@@ -115,8 +123,16 @@ class RLTrainer(BaseVLNCETrainer):
                 self._make_results_dir()
 
     def save_checkpoint(self, iteration: int):
-        experiment_metadata = ({'e12_initial_decoder_sha256': self.successor_initial_digest}
-                               if self.successor_only else {})
+        if self.successor_only:
+            experiment_metadata = {
+                'e12_initial_decoder_sha256': self.successor_initial_digest
+            }
+        elif self.instruction_coverage_only:
+            experiment_metadata = {
+                'e13_optimizer_updates': self.e13_optimizer_updates
+            }
+        else:
+            experiment_metadata = {}
         if self.config.ONLY_LAST_SAVEALL and (not iteration == self.config.GRPO.iters):
             torch.save(
                         obj={
@@ -341,6 +357,7 @@ class RLTrainer(BaseVLNCETrainer):
             geo_token_only = getattr(
                 self.config.GRPO, 'geo_token_only', False
             )
+            instruction_coverage_only = self.instruction_coverage_only
             if success_set_commit and not terminal_commit_only:
                 raise ValueError(
                     'success_set_commit requires terminal_commit_only'
@@ -350,7 +367,8 @@ class RLTrainer(BaseVLNCETrainer):
                         gauss_only, scorer_only, gaussian_bev_only,
                         anchor_repair_only, hindsight_stop_only,
                         terminal_commit_only, success_set_commit,
-                        frontier_advantage, geo_token_only]):
+                        frontier_advantage, geo_token_only,
+                        instruction_coverage_only]):
                     raise ValueError(
                         'E9 cannot use E2-E8 training modes'
                     )
@@ -362,7 +380,8 @@ class RLTrainer(BaseVLNCETrainer):
                         self.config.MODEL.anchor_repair_hidden_size != 0 or
                         self.config.MODEL.hindsight_stop_hidden_size != 0 or
                         self.config.MODEL.terminal_commit_hidden_size != 0 or
-                        self.config.MODEL.geo_token_hidden_size != 0):
+                        self.config.MODEL.geo_token_hidden_size != 0 or
+                        self.config.MODEL.instruction_coverage_hidden_size != 0):
                     raise ValueError(
                         'E9 requires R2R, sample_num=8, and no E2-E8 module'
                     )
@@ -371,7 +390,8 @@ class RLTrainer(BaseVLNCETrainer):
                         gauss_only, scorer_only, gaussian_bev_only,
                         anchor_repair_only, hindsight_stop_only,
                         terminal_commit_only, success_set_commit,
-                        setwise_group_policy, geo_token_only]):
+                        setwise_group_policy, geo_token_only,
+                        instruction_coverage_only]):
                     raise ValueError('E10 cannot use E2-E9 training modes')
                 if (self.config.GRPO.sample_num != 8 or
                         self.config.MODEL.task_type != 'r2r' or
@@ -381,14 +401,16 @@ class RLTrainer(BaseVLNCETrainer):
                         self.config.MODEL.anchor_repair_hidden_size != 0 or
                         self.config.MODEL.hindsight_stop_hidden_size != 0 or
                         self.config.MODEL.terminal_commit_hidden_size != 0 or
-                        self.config.MODEL.geo_token_hidden_size != 0):
+                        self.config.MODEL.geo_token_hidden_size != 0 or
+                        self.config.MODEL.instruction_coverage_hidden_size != 0):
                     raise ValueError(
                         'E10 requires R2R, sample_num=8, and no E2-E8 module'
                     )
             if sum([
                     gauss_only, scorer_only, gaussian_bev_only,
                     anchor_repair_only, hindsight_stop_only,
-                    terminal_commit_only, geo_token_only]) > 1:
+                    terminal_commit_only, geo_token_only,
+                    instruction_coverage_only]) > 1:
                 raise ValueError(
                     'GRPO lightweight-only modes are mutually exclusive'
                 )
@@ -396,7 +418,8 @@ class RLTrainer(BaseVLNCETrainer):
                 if (any([gauss_only, scorer_only, gaussian_bev_only,
                          anchor_repair_only, hindsight_stop_only,
                          terminal_commit_only, success_set_commit,
-                         setwise_group_policy, frontier_advantage, geo_token_only]) or
+                         setwise_group_policy, frontier_advantage, geo_token_only,
+                         instruction_coverage_only]) or
                         vln_bert_module.successor is None or
                         self.config.GPU_NUMBERS != 1 or self.enable_amp or
                         self.enable_all_dropouts or self.dropout_in_sampling or
@@ -405,6 +428,41 @@ class RLTrainer(BaseVLNCETrainer):
                         self.config.GRPO.is_requeue):
                     raise ValueError('E12 requires independent, single-GPU, dropout-free control training')
                 self.trainable_parts = [vln_bert_module.successor]
+            elif instruction_coverage_only:
+                coverage = vln_bert_module.instruction_coverage
+                if coverage is None:
+                    raise ValueError(
+                        'instruction_coverage_only requires '
+                        'MODEL.instruction_coverage_hidden_size > 0'
+                    )
+                if (self.config.GRPO.sample_num != 8 or
+                        self.config.GRPO.update_epochs != 1 or
+                        self.config.GRPO.batch_size != 1 or
+                        abs(self.config.GRPO.lr - 1e-4) > 1e-12 or
+                        abs(self.config.GRPO.grpo_beta - 0.04) > 1e-12 or
+                        self.config.MODEL.task_type != 'r2r' or
+                        self.config.MODEL.gauss_feat_size != 0 or
+                        self.config.MODEL.candidate_scorer_hidden_size != 0 or
+                        self.config.MODEL.gaussian_bev_hidden_size != 0 or
+                        self.config.MODEL.anchor_repair_hidden_size != 0 or
+                        self.config.MODEL.hindsight_stop_hidden_size != 0 or
+                        self.config.MODEL.terminal_commit_hidden_size != 0 or
+                        self.config.MODEL.geo_token_hidden_size != 0 or
+                        self.config.MODEL.successor_hidden_size != 0 or
+                        self.config.MODEL.instruction_coverage_hidden_size != 32 or
+                        success_set_commit or setwise_group_policy or
+                        frontier_advantage or self.config.GPU_NUMBERS != 1 or
+                        self.enable_amp or self.enable_all_dropouts or
+                        self.dropout_in_sampling or
+                        self.config.GRPO.waypoint_aug or
+                        self.config.GRPO.back_algo != 'control' or
+                        self.config.GRPO.is_requeue):
+                    raise ValueError(
+                        'E13 requires strict E0, R2R, sample_num=8, a '
+                        '32-wide coverage head, and independent single-GPU '
+                        'dropout-free control training'
+                    )
+                self.trainable_parts = [coverage]
             elif geo_token_only:
                 geo_token = vln_bert_module.geo_token
                 if geo_token is None:
@@ -544,6 +602,18 @@ class RLTrainer(BaseVLNCETrainer):
         if self.successor_only and (not trainable_parameters or any(
                 '.successor.' not in name for name, _ in trainable_parameters)):
             raise RuntimeError('E12 may only update the successor decoder')
+        if self.instruction_coverage_only:
+            trainable_count = sum(p.numel() for _, p in trainable_parameters)
+            invalid_names = [
+                name for name, _ in trainable_parameters
+                if '.instruction_coverage.' not in name
+            ]
+            if invalid_names or trainable_count != 449:
+                raise RuntimeError(
+                    'E13 expected exactly 449 instruction-coverage '
+                    'parameters, got invalid=%s and %d parameters' %
+                    (invalid_names, trainable_count)
+                )
         if getattr(self.config.GRPO, 'gauss_only', False):
             trainable_count = sum(p.numel() for _, p in trainable_parameters)
             if len(trainable_parameters) != 1 or trainable_count != 3840:
@@ -714,6 +784,23 @@ class RLTrainer(BaseVLNCETrainer):
                 }
                 if actual_missing != expected_missing or incompatible_keys.unexpected_keys:
                     raise RuntimeError('E12 must start from a complete E0 with no successor weights')
+
+            if self.instruction_coverage_only:
+                expected_missing = {
+                    'net.vln_bert.instruction_coverage.' + name
+                    for name in vln_bert_module.instruction_coverage.state_dict()
+                }
+                actual_missing = {
+                    key.replace('net.module.', 'net.')
+                    for key in incompatible_keys.missing_keys
+                }
+                if (actual_missing != expected_missing or
+                        incompatible_keys.unexpected_keys):
+                    raise RuntimeError(
+                        'E13 must start from a complete E0 with no coverage '
+                        'weights'
+                    )
+                vln_bert_module.instruction_coverage.reset_output()
 
             if getattr(self.config.GRPO, 'gauss_only', False):
                 invalid_missing = [
@@ -1005,6 +1092,7 @@ class RLTrainer(BaseVLNCETrainer):
         batch_gmap_vp_ids, batch_gmap_step_ids, batch_gmap_lens = [], [], []
         batch_gmap_img_fts, batch_gmap_pos_fts = [], []
         batch_gmap_pair_dists, batch_gmap_visited_masks = [], []
+        batch_gmap_instruction_evidence = []
         batch_no_vp_left = []
         batch_gmap_task_embeddings = []
 
@@ -1056,6 +1144,14 @@ class RLTrainer(BaseVLNCETrainer):
             batch_gmap_pos_fts.append(torch.from_numpy(gmap_pos_fts))
             batch_gmap_pair_dists.append(torch.from_numpy(gmap_pair_dists))
             batch_gmap_visited_masks.append(torch.BoolTensor(gmap_visited_masks))
+            if gmap.instruction_evidence_size:
+                instruction_evidence = [
+                    gmap.get_instruction_evidence(vp)
+                    for vp in node_vp_ids + ghost_vp_ids
+                ]
+                batch_gmap_instruction_evidence.append(torch.stack([
+                    torch.zeros_like(instruction_evidence[0])
+                ] + instruction_evidence))
         
         batch_gmap_step_ids = pad_sequence(batch_gmap_step_ids, batch_first=True).cuda()
         batch_gmap_task_embeddings = pad_sequence(batch_gmap_task_embeddings, batch_first=True).cuda()
@@ -1072,12 +1168,17 @@ class RLTrainer(BaseVLNCETrainer):
             gmap_pair_dists[i, :batch_gmap_lens[i], :batch_gmap_lens[i]] = batch_gmap_pair_dists[i]
         gmap_pair_dists = gmap_pair_dists.cuda()
 
-        return {
+        outputs = {
             'gmap_vp_ids': batch_gmap_vp_ids, 'gmap_step_ids': batch_gmap_step_ids,
             'gmap_img_fts': batch_gmap_img_fts, 'gmap_pos_fts': batch_gmap_pos_fts, 
             'gmap_masks': batch_gmap_masks, 'gmap_visited_masks': batch_gmap_visited_masks, 'gmap_pair_dists': gmap_pair_dists,
             'no_vp_left': batch_no_vp_left, 'gmap_task_embeddings': batch_gmap_task_embeddings
         }
+        if batch_gmap_instruction_evidence:
+            outputs['gmap_instruction_evidence'] = pad_tensors_wgrad(
+                batch_gmap_instruction_evidence
+            )
+        return outputs
 
     def train(self):
         self._set_config()
@@ -1303,6 +1404,44 @@ class RLTrainer(BaseVLNCETrainer):
             )
             decision_count = sum(
                 sample['decision_count'] for sample in self.data_buffer[1:]
+            )
+            self.logs['intervention_rate'].append(
+                intervention_count / max(decision_count, 1)
+            )
+
+        if self.instruction_coverage_only:
+            coverage_sum = sum(
+                sample['coverage_sum'] for sample in self.data_buffer
+            )
+            coverage_count = sum(
+                sample['coverage_count'] for sample in self.data_buffer
+            )
+            marginal_sum = sum(
+                sample['marginal_sum'] for sample in self.data_buffer
+            )
+            marginal_count = sum(
+                sample['marginal_count'] for sample in self.data_buffer
+            )
+            residual_abs_sum = sum(
+                sample['residual_abs_sum'] for sample in self.data_buffer
+            )
+            residual_count = sum(
+                sample['residual_count'] for sample in self.data_buffer
+            )
+            intervention_count = sum(
+                sample['intervention_count'] for sample in self.data_buffer
+            )
+            decision_count = sum(
+                sample['decision_count'] for sample in self.data_buffer
+            )
+            self.logs['coverage_mean'].append(
+                coverage_sum / max(coverage_count, 1)
+            )
+            self.logs['marginal_gain_mean'].append(
+                marginal_sum / max(marginal_count, 1)
+            )
+            self.logs['residual_abs_mean'].append(
+                residual_abs_sum / max(residual_count, 1)
             )
             self.logs['intervention_rate'].append(
                 intervention_count / max(decision_count, 1)
@@ -1544,6 +1683,8 @@ class RLTrainer(BaseVLNCETrainer):
                 )
 
         if actual_epochs_processed > 0:
+            if self.instruction_coverage_only:
+                self.e13_optimizer_updates += 1
             self.logs['policy_loss'].append(total_policy_loss_across_epochs / actual_epochs_processed)
             if self.need_ref_policy:
                 self.logs['kl_loss'].append(total_kl_loss_across_epochs / actual_epochs_processed)
@@ -1967,6 +2108,12 @@ class RLTrainer(BaseVLNCETrainer):
             "initial_txt_masks": all_txt_masks.detach().cpu(),
             "intervention_count": 0,
             "decision_count": 0,
+            "coverage_sum": 0.0,
+            "coverage_count": 0,
+            "marginal_sum": 0.0,
+            "marginal_count": 0,
+            "residual_abs_sum": 0.0,
+            "residual_count": 0,
             "success": [None] * self.envs.num_envs,
             "oracle_success": [None] * self.envs.num_envs,
             "setwise_outcome": [None] * self.envs.num_envs,
@@ -1984,6 +2131,13 @@ class RLTrainer(BaseVLNCETrainer):
                                ghost_aug,
                                gauss_feat_size=getattr(
                                    self.config.MODEL, 'gauss_feat_size', 0
+                               ),
+                               instruction_evidence_size=(
+                                   NUM_INSTRUCTION_SLOTS
+                                   if getattr(
+                                       self.config.MODEL,
+                                       'instruction_coverage_hidden_size', 0
+                                   ) > 0 else 0
                                )) for _ in range(self.envs.num_envs)]
         prev_vp = [None] * self.envs.num_envs
         path_lengths = [0.0] * self.envs.num_envs
@@ -2010,6 +2164,21 @@ class RLTrainer(BaseVLNCETrainer):
             pano_embeds, pano_masks = self.policy.net(**vp_inputs)
             avg_pano_embeds = torch.sum(pano_embeds * pano_masks.unsqueeze(2), 1) / \
                               torch.sum(pano_masks, 1, keepdim=True)
+            pano_instruction_evidence = None
+            current_instruction_evidence = None
+            if getattr(
+                    self.config.MODEL,
+                    'instruction_coverage_hidden_size', 0) > 0:
+                pano_instruction_evidence, _ = self.policy.net(
+                    mode='instruction_evidence',
+                    view_embeds=pano_embeds,
+                    view_masks=pano_masks,
+                    txt_embeds=txt_embeds,
+                    txt_masks=txt_masks,
+                )
+                current_instruction_evidence = aggregate_view_evidence(
+                    pano_instruction_evidence, pano_masks
+                )
 
             cur_pos, cur_ori = self.get_pos_ori()
             cur_vp, cand_vp, cand_pos = [], [], []
@@ -2036,11 +2205,21 @@ class RLTrainer(BaseVLNCETrainer):
             for i in range(self.envs.num_envs):
                 cur_embeds = avg_pano_embeds[i]
                 cand_embeds = pano_embeds[i][vp_inputs['nav_types'][i]==1] 
+                cand_instruction_evidence = (
+                    pano_instruction_evidence[i][
+                        vp_inputs['nav_types'][i] == 1
+                    ] if pano_instruction_evidence is not None else None
+                )
                 candidate_targets.append(self.gmaps[i].update_graph(
                     prev_vp[i], stepk+1,
                     cur_vp[i], cur_pos[i], cur_embeds,
                     cand_vp[i], cand_pos[i], cand_embeds,
                     cand_real_pos[i],
+                    cur_instruction_evidence=(
+                        current_instruction_evidence[i]
+                        if current_instruction_evidence is not None else None
+                    ),
+                    cand_instruction_evidence=cand_instruction_evidence,
                 ))
 
             if hindsight_stop_only or terminal_commit_only:
@@ -2129,6 +2308,33 @@ class RLTrainer(BaseVLNCETrainer):
 
             nav_inputs_copy_for_cpu = self.copy_nav_inputs_dict(nav_inputs)
             nav_outs = self.policy.net(**nav_inputs_for_gpu)
+            if self.instruction_coverage_only:
+                frontier_masks = (
+                    nav_inputs['gmap_masks'] &
+                    nav_inputs['gmap_visited_masks'].logical_not()
+                ).clone()
+                frontier_masks[:, 0] = False
+                coverage = nav_outs['instruction_coverage']
+                marginal = nav_outs['instruction_marginal']
+                residual = nav_outs['instruction_coverage_residual']
+                data_this_sample['coverage_sum'] += coverage.sum().item()
+                data_this_sample['coverage_count'] += coverage.numel()
+                frontier_slots = frontier_masks.unsqueeze(-1).expand_as(
+                    marginal
+                )
+                data_this_sample['marginal_sum'] += marginal.masked_select(
+                    frontier_slots
+                ).sum().item()
+                data_this_sample['marginal_count'] += frontier_slots.sum().item()
+                data_this_sample['residual_abs_sum'] += residual.abs().masked_select(
+                    frontier_masks
+                ).sum().item()
+                data_this_sample['residual_count'] += frontier_masks.sum().item()
+                data_this_sample['intervention_count'] += (
+                    nav_outs['global_logits'].argmax(dim=-1) !=
+                    nav_outs['base_global_logits'].argmax(dim=-1)
+                ).sum().item()
+                data_this_sample['decision_count'] += frontier_masks.size(0)
             if use_base_policy:
                 nav_logits = nav_outs['base_global_logits']
             else:

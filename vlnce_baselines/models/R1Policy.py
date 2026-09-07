@@ -171,6 +171,8 @@ class ETP(Net):
                 gmap_masks=None, gmap_visited_masks=None, gmap_pair_dists=None,
                 gmap_task_embeddings=None, gmap_stop_scores=None,
                 gmap_geo_tokens=None, gmap_geo_masks=None,
+                view_embeds=None, view_masks=None,
+                gmap_instruction_evidence=None,
                 successor_override=None):
 
         if mode == 'language':
@@ -395,6 +397,11 @@ class ETP(Net):
             )
             return outs
 
+        elif mode == 'instruction_evidence':
+            return self.vln_bert.forward_instruction_evidence(
+                view_embeds, view_masks, txt_embeds, txt_masks
+            )
+
         elif mode == 'navigation':
             outs = self.vln_bert.forward_navigation(
                 txt_embeds, txt_masks,
@@ -403,6 +410,7 @@ class ETP(Net):
                 gmap_masks, gmap_visited_masks, gmap_pair_dists,
                 gmap_task_embeddings, gmap_stop_scores,
                 gmap_geo_tokens, gmap_geo_masks,
+                gmap_instruction_evidence,
                 successor_override,
             )
             return outs

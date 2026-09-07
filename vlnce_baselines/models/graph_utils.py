@@ -3,6 +3,7 @@ import numpy as np
 from copy import deepcopy
 import networkx as nx
 import matplotlib.pyplot as plt
+import torch
 from habitat.tasks.utils import cartesian_to_polar
 from habitat.utils.geometry_utils import quaternion_rotate_vector, quaternion_from_coeff
 
@@ -142,7 +143,7 @@ class GraphMap(object):
     GAUSS_MAX_STD = 3.0
 
     def __init__(self, has_real_pos, loc_noise, merge_ghost, ghost_aug,
-                 gauss_feat_size=0):
+                 gauss_feat_size=0, instruction_evidence_size=0):
         if gauss_feat_size not in (0, self.GAUSS_FEAT_SIZE):
             raise ValueError(
                 'gauss_feat_size must be 0 or %d, got %s' %
@@ -150,19 +151,24 @@ class GraphMap(object):
             )
         if gauss_feat_size and loc_noise <= 0:
             raise ValueError('loc_noise must be positive when Gaussian features are enabled')
+        if instruction_evidence_size not in (0, 4):
+            raise ValueError('instruction_evidence_size must be 0 or 4')
 
         self.gauss_feat_size = gauss_feat_size
+        self.instruction_evidence_size = instruction_evidence_size
 
         self.graph_nx = nx.Graph()
 
         self.node_pos = {}          # viewpoint to position (x, y, z)
         self.node_embeds = {}       # viewpoint to pano feature
+        self.node_instruction_evidence = {}
         self.node_stepId = {}
 
         self.ghost_cnt = 0          # id to create ghost 
         self.ghost_pos = {}
         self.ghost_mean_pos = {}
         self.ghost_embeds = {}      # viewpoint to single_view feature
+        self.ghost_instruction_evidence = {}
         self.ghost_fronts = {}      # viewpoint to front_vp id
         self.ghost_real_pos = {}    # for training
         self.has_real_pos = has_real_pos
@@ -202,13 +208,25 @@ class GraphMap(object):
         self.ghost_mean_pos.pop(vp)
         self.ghost_embeds.pop(vp)
         self.ghost_fronts.pop(vp)
+        if self.instruction_evidence_size:
+            self.ghost_instruction_evidence.pop(vp)
         if self.has_real_pos:
             self.ghost_real_pos.pop(vp)
 
     def update_graph(self, prev_vp, step_id,
                            cur_vp, cur_pos, cur_embeds,
                            cand_vp, cand_pos, cand_embeds, 
-                           cand_real_pos):
+                           cand_real_pos,
+                           cur_instruction_evidence=None,
+                           cand_instruction_evidence=None):
+        if self.instruction_evidence_size:
+            expected = (self.instruction_evidence_size,)
+            if (cur_instruction_evidence is None or
+                    tuple(cur_instruction_evidence.shape) != expected or
+                    cand_instruction_evidence is None or
+                    tuple(cand_instruction_evidence.shape) !=
+                    (len(cand_vp), self.instruction_evidence_size)):
+                raise ValueError('Instruction evidence is missing or misaligned')
         # 1. connect prev_vp
         self.graph_nx.add_node(cur_vp)
         if prev_vp is not None:
@@ -219,6 +237,10 @@ class GraphMap(object):
         # 2. update node & ghost info
         self.node_pos[cur_vp] = cur_pos
         self.node_embeds[cur_vp] = cur_embeds
+        if self.instruction_evidence_size:
+            self.node_instruction_evidence[cur_vp] = (
+                cur_instruction_evidence.detach().clone()
+            )
         self.node_stepId[cur_vp] = step_id
         candidate_targets = []
         for i, (cvp, cpos, cembeds) in enumerate(zip(cand_vp, cand_pos, cand_embeds)):
@@ -239,6 +261,10 @@ class GraphMap(object):
                         self.ghost_pos[gvp] = [cpos]
                         self.ghost_mean_pos[gvp] = cpos
                         self.ghost_embeds[gvp] = [cembeds, 1]
+                        if self.instruction_evidence_size:
+                            self.ghost_instruction_evidence[gvp] = (
+                                cand_instruction_evidence[i].detach().clone()
+                            )
                         self.ghost_fronts[gvp] = [cur_vp]
                         if self.has_real_pos:
                             self.ghost_real_pos[gvp] = [cand_real_pos[i]]
@@ -249,6 +275,11 @@ class GraphMap(object):
                         self.ghost_mean_pos[gvp] = np.mean(self.ghost_pos[gvp], axis=0)
                         self.ghost_embeds[gvp][0] = self.ghost_embeds[gvp][0] + cembeds
                         self.ghost_embeds[gvp][1] += 1
+                        if self.instruction_evidence_size:
+                            self.ghost_instruction_evidence[gvp] = torch.maximum(
+                                self.ghost_instruction_evidence[gvp],
+                                cand_instruction_evidence[i].detach(),
+                            )
                         self.ghost_fronts[gvp].append(cur_vp)
                         if self.has_real_pos:
                             self.ghost_real_pos[gvp].append(cand_real_pos[i])
@@ -258,6 +289,10 @@ class GraphMap(object):
                     self.ghost_pos[gvp] = [cpos]
                     self.ghost_mean_pos[gvp] = cpos
                     self.ghost_embeds[gvp] = [cembeds, 1]
+                    if self.instruction_evidence_size:
+                        self.ghost_instruction_evidence[gvp] = (
+                            cand_instruction_evidence[i].detach().clone()
+                        )
                     self.ghost_fronts[gvp] = [cur_vp]
                     if self.has_real_pos:
                         self.ghost_real_pos[gvp] = [cand_real_pos[i]]
@@ -293,6 +328,13 @@ class GraphMap(object):
             return self.node_embeds[vp]
         else:
             return self.ghost_embeds[vp][0] / self.ghost_embeds[vp][1]
+
+    def get_instruction_evidence(self, vp):
+        if not self.instruction_evidence_size:
+            raise RuntimeError('Instruction evidence is disabled')
+        if vp.startswith('g'):
+            return self.ghost_instruction_evidence[vp]
+        return self.node_instruction_evidence[vp]
 
     def get_pos_fts(self, cur_vp, cur_pos, cur_ori, gmap_vp_ids):
         rel_angles, rel_dists = [], []

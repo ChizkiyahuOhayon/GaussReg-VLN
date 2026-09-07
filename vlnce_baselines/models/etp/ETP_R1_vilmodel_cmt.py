@@ -1279,12 +1279,37 @@ class GlocalTextPathNavCMT(BertPreTrainedModel):
         else:
             self.geo_token = None
 
+        instruction_coverage_hidden_size = getattr(
+            config, 'instruction_coverage_hidden_size', 0
+        )
+        if instruction_coverage_hidden_size > 0:
+            if any([
+                    self.candidate_scorer is not None,
+                    self.gaussian_bev is not None,
+                    self.anchor_repair is not None,
+                    self.hindsight_stop is not None,
+                    self.terminal_commit is not None,
+                    self.geo_token is not None]) or getattr(
+                        config, 'gauss_feat_size', 0):
+                raise ValueError(
+                    'instruction coverage requires E2-E12 modules off'
+                )
+            from vlnce_baselines.instruction_coverage import (
+                InstructionCoverageResidual,
+            )
+            self.instruction_coverage = InstructionCoverageResidual(
+                instruction_coverage_hidden_size
+            )
+        else:
+            self.instruction_coverage = None
+
         self.successor = None
         self.successor_sampling_base = False
         successor_size = getattr(config, 'successor_hidden_size', 0)
         if successor_size:
             if any([self.candidate_scorer, self.gaussian_bev, self.anchor_repair,
-                    self.hindsight_stop, self.terminal_commit, self.geo_token]) or getattr(config, 'gauss_feat_size', 0):
+                    self.hindsight_stop, self.terminal_commit, self.geo_token,
+                    self.instruction_coverage]) or getattr(config, 'gauss_feat_size', 0):
                 raise ValueError('E12 successor evidence requires E2-E11 modules off')
             from vlnce_baselines.successor import SuccessorDecoder
             self.successor = SuccessorDecoder(config.hidden_size, successor_size)
@@ -1304,6 +1329,8 @@ class GlocalTextPathNavCMT(BertPreTrainedModel):
             self.terminal_commit.reset_output()
         if self.geo_token is not None:
             self.geo_token.reset_output()
+        if self.instruction_coverage is not None:
+            self.instruction_coverage.reset_output()
         
         if config.fix_lang_embedding:
             print("FIX LANG EMBEDDING!!!!!!!!!!!!!!!!!!!!!!!!")
@@ -1357,6 +1384,26 @@ class GlocalTextPathNavCMT(BertPreTrainedModel):
             )
         return pano_embeds, pano_masks
 
+    def forward_instruction_evidence(
+        self, view_embeds, view_masks, txt_embeds, txt_masks
+    ):
+        from vlnce_baselines.instruction_coverage import (
+            instruction_slot_evidence,
+        )
+
+        _, attention_scores = self.graph_query_text(
+            view_embeds,
+            txt_embeds,
+            attention_mask=extend_neg_masks(txt_masks),
+        )
+        evidence, slot_masks = instruction_slot_evidence(
+            attention_scores, txt_masks
+        )
+        evidence = evidence.masked_fill(
+            view_masks.unsqueeze(-1).logical_not(), 0.0
+        )
+        return evidence.detach(), slot_masks
+
     def forward_navigation(
         self, txt_embeds, txt_masks, 
         gmap_vpids, gmap_step_ids, 
@@ -1364,6 +1411,7 @@ class GlocalTextPathNavCMT(BertPreTrainedModel):
         gmap_masks, gmap_visited_masks, gmap_pair_dists, gmap_task_embeddings,
         gmap_stop_scores=None,
         gmap_geo_tokens=None, gmap_geo_masks=None,
+        gmap_instruction_evidence=None,
         successor_override=None,
     ):
         # global branch
@@ -1429,6 +1477,20 @@ class GlocalTextPathNavCMT(BertPreTrainedModel):
         global_logits.masked_fill_(gmap_masks.logical_not(), -float('inf'))
 
         base_global_logits = global_logits
+        coverage = None
+        marginal = None
+        coverage_residual = None
+        if self.instruction_coverage is not None:
+            if gmap_instruction_evidence is None:
+                raise ValueError(
+                    'instruction coverage requires aligned graph evidence'
+                )
+            coverage_residual, coverage, marginal = self.instruction_coverage(
+                gmap_instruction_evidence,
+                gmap_masks,
+                gmap_visited_masks,
+            )
+            global_logits = base_global_logits + coverage_residual
         if self.anchor_repair is not None:
             global_logits = self.anchor_repair(
                 base_global_logits, fusion_input, gmap_pos_fts,
@@ -1472,10 +1534,15 @@ class GlocalTextPathNavCMT(BertPreTrainedModel):
             outs['successor_features'] = successor_features
         if (self.anchor_repair is not None or
                 self.hindsight_stop is not None or
-                self.terminal_commit is not None):
+                self.terminal_commit is not None or
+                self.instruction_coverage is not None):
             outs['base_global_logits'] = base_global_logits
         if hindsight_stop_logits is not None:
             outs['hindsight_stop_logits'] = hindsight_stop_logits
         if terminal_commit_logits is not None:
             outs['terminal_commit_logits'] = terminal_commit_logits
+        if coverage_residual is not None:
+            outs['instruction_coverage'] = coverage
+            outs['instruction_marginal'] = marginal
+            outs['instruction_coverage_residual'] = coverage_residual
         return outs

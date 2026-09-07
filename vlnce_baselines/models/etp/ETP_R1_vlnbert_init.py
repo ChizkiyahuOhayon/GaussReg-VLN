@@ -66,6 +66,9 @@ def get_vlnbert_models(config=None, dropout_rate=0.1):
         config, 'geo_token_hidden_size', 0
     )
     vis_config.successor_hidden_size = getattr(config, 'successor_hidden_size', 0)
+    vis_config.instruction_coverage_hidden_size = getattr(
+        config, 'instruction_coverage_hidden_size', 0
+    )
 
     vis_config.num_l_layers = 12
     vis_config.num_pano_layers = 2
@@ -138,4 +141,11 @@ def get_vlnbert_models(config=None, dropout_rate=0.1):
     if visual_model.geo_token is not None and not has_geo_token:
         # from_pretrained reinitializes missing keys after model.__init__.
         visual_model.geo_token.reset_output()
+    has_instruction_coverage = any(
+        'instruction_coverage.' in key for key in new_ckpt_weights
+    )
+    if (visual_model.instruction_coverage is not None and
+            not has_instruction_coverage):
+        # from_pretrained reinitializes missing keys after model.__init__.
+        visual_model.instruction_coverage.reset_output()
     return visual_model
