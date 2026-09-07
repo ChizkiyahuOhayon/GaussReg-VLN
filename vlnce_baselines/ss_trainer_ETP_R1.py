@@ -287,6 +287,10 @@ class RLTrainer(BaseVLNCETrainer):
                 incompatible_keys = self.policy.load_state_dict(new_state_dict, strict=False)
             else:
                 incompatible_keys = self.policy.load_state_dict(ckpt_dict["state_dict"], strict=False)
+            if getattr(config.MODEL, 'successor_hidden_size', 0) and (
+                    incompatible_keys.missing_keys or incompatible_keys.unexpected_keys):
+                raise RuntimeError('E12 evaluation requires an exact complete checkpoint: %s' %
+                                   str(incompatible_keys))
             
             if self.local_rank < 1:
                 print("\n" + "="*25 + " Weight loading mismatch report " + "="*25)

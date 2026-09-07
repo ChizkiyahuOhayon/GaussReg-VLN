@@ -170,7 +170,8 @@ class ETP(Net):
                 gmap_img_fts=None, gmap_pos_fts=None,
                 gmap_masks=None, gmap_visited_masks=None, gmap_pair_dists=None,
                 gmap_task_embeddings=None, gmap_stop_scores=None,
-                gmap_geo_tokens=None, gmap_geo_masks=None):
+                gmap_geo_tokens=None, gmap_geo_masks=None,
+                successor_override=None):
 
         if mode == 'language':
             encoded_sentence = self.vln_bert.forward_txt(
@@ -402,6 +403,7 @@ class ETP(Net):
                 gmap_masks, gmap_visited_masks, gmap_pair_dists,
                 gmap_task_embeddings, gmap_stop_scores,
                 gmap_geo_tokens, gmap_geo_masks,
+                successor_override,
             )
             return outs
 

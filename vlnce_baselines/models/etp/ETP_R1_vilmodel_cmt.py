@@ -1279,6 +1279,16 @@ class GlocalTextPathNavCMT(BertPreTrainedModel):
         else:
             self.geo_token = None
 
+        self.successor = None
+        self.successor_sampling_base = False
+        successor_size = getattr(config, 'successor_hidden_size', 0)
+        if successor_size:
+            if any([self.candidate_scorer, self.gaussian_bev, self.anchor_repair,
+                    self.hindsight_stop, self.terminal_commit, self.geo_token]) or getattr(config, 'gauss_feat_size', 0):
+                raise ValueError('E12 successor evidence requires E2-E11 modules off')
+            from vlnce_baselines.successor import SuccessorDecoder
+            self.successor = SuccessorDecoder(config.hidden_size, successor_size)
+
         self.init_weights()
         if self.global_encoder.gmap_gauss_embedding is not None:
             nn.init.zeros_(self.global_encoder.gmap_gauss_embedding.weight)
@@ -1354,6 +1364,7 @@ class GlocalTextPathNavCMT(BertPreTrainedModel):
         gmap_masks, gmap_visited_masks, gmap_pair_dists, gmap_task_embeddings,
         gmap_stop_scores=None,
         gmap_geo_tokens=None, gmap_geo_masks=None,
+        successor_override=None,
     ):
         # global branch
         batch_size = gmap_task_embeddings.size(0)
@@ -1366,6 +1377,20 @@ class GlocalTextPathNavCMT(BertPreTrainedModel):
                       task_type_encoding + \
                       self.global_encoder.position_embedding(gmap_pos_fts)
 
+        action_slots = gmap_embeds.size(1)
+        encoder_masks = gmap_masks
+        successor_features = None
+        if self.successor is not None and not self.successor_sampling_base:
+            from vlnce_baselines.successor import expand_successor_graph
+            successor_features = self.successor(
+                gmap_embeds, gmap_masks, txt_embeds, txt_masks
+            ) if successor_override is None else successor_override
+            gmap_embeds, encoder_masks, gmap_pair_dists = expand_successor_graph(
+                gmap_embeds, successor_features,
+                gmap_embeds - gmap_img_fts,
+                gmap_masks, gmap_visited_masks, gmap_pair_dists,
+            )
+
         if self.global_encoder.sprel_linear is not None:
             graph_sprels = self.global_encoder.sprel_linear(
                 gmap_pair_dists.unsqueeze(3)).squeeze(3).unsqueeze(1)
@@ -1373,9 +1398,10 @@ class GlocalTextPathNavCMT(BertPreTrainedModel):
             graph_sprels = None
 
         txt_embeds, gmap_embeds = self.global_encoder.encoder(
-            txt_embeds, txt_masks, gmap_embeds, gmap_masks,
+            txt_embeds, txt_masks, gmap_embeds, encoder_masks,
             graph_sprels=graph_sprels
         )
+        gmap_embeds = gmap_embeds[:, :action_slots]
         
         extended_txt_masks = extend_neg_masks(txt_masks)
 
@@ -1442,6 +1468,8 @@ class GlocalTextPathNavCMT(BertPreTrainedModel):
             'gmap_embeds': gmap_embeds, 
             'global_logits': global_logits
         }
+        if successor_features is not None:
+            outs['successor_features'] = successor_features
         if (self.anchor_repair is not None or
                 self.hindsight_stop is not None or
                 self.terminal_commit is not None):

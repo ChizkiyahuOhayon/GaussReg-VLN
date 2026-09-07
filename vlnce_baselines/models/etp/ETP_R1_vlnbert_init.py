@@ -65,6 +65,7 @@ def get_vlnbert_models(config=None, dropout_rate=0.1):
     vis_config.geo_token_hidden_size = getattr(
         config, 'geo_token_hidden_size', 0
     )
+    vis_config.successor_hidden_size = getattr(config, 'successor_hidden_size', 0)
 
     vis_config.num_l_layers = 12
     vis_config.num_pano_layers = 2

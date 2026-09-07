@@ -98,6 +98,9 @@ class RLTrainer(BaseVLNCETrainer):
         self.enable_all_dropouts = config.GRPO.enable_all_dropouts
         self.dropout_in_sampling = config.GRPO.dropout_in_sampling
         self.dropout_rate = config.GRPO.dropout_rate
+        self.successor_only = getattr(config.GRPO, 'successor_only', False)
+        if self.successor_only:
+            self.need_ref_policy = False
         self.frontier_advantage = getattr(
             config.GRPO, 'frontier_advantage', False
         )
@@ -112,12 +115,15 @@ class RLTrainer(BaseVLNCETrainer):
                 self._make_results_dir()
 
     def save_checkpoint(self, iteration: int):
+        experiment_metadata = ({'e12_initial_decoder_sha256': self.successor_initial_digest}
+                               if self.successor_only else {})
         if self.config.ONLY_LAST_SAVEALL and (not iteration == self.config.GRPO.iters):
             torch.save(
                         obj={
                             "state_dict": self.policy.state_dict(), 
                             "config": self.config, 
-                            "iteration": iteration
+                            "iteration": iteration,
+                            **experiment_metadata,
                         },
                         f=os.path.join(self.config.CHECKPOINT_FOLDER, f"ckpt.iter{iteration}.pth"),
                     )
@@ -129,6 +135,7 @@ class RLTrainer(BaseVLNCETrainer):
                     "optim_state": self.optimizer.state_dict(), 
                     "scheduler_state": self.scheduler.state_dict(), 
                     "iteration": iteration, 
+                    **experiment_metadata,
                 },
                 f=os.path.join(self.config.CHECKPOINT_FOLDER, f"ckpt.iter{iteration}.pth"),
             )
@@ -385,7 +392,20 @@ class RLTrainer(BaseVLNCETrainer):
                 raise ValueError(
                     'GRPO lightweight-only modes are mutually exclusive'
                 )
-            if geo_token_only:
+            if self.successor_only:
+                if (any([gauss_only, scorer_only, gaussian_bev_only,
+                         anchor_repair_only, hindsight_stop_only,
+                         terminal_commit_only, success_set_commit,
+                         setwise_group_policy, frontier_advantage, geo_token_only]) or
+                        vln_bert_module.successor is None or
+                        self.config.GPU_NUMBERS != 1 or self.enable_amp or
+                        self.enable_all_dropouts or self.dropout_in_sampling or
+                        self.config.GRPO.waypoint_aug or
+                        self.config.GRPO.back_algo != 'control' or
+                        self.config.GRPO.is_requeue):
+                    raise ValueError('E12 requires independent, single-GPU, dropout-free control training')
+                self.trainable_parts = [vln_bert_module.successor]
+            elif geo_token_only:
                 geo_token = vln_bert_module.geo_token
                 if geo_token is None:
                     raise ValueError(
@@ -521,6 +541,9 @@ class RLTrainer(BaseVLNCETrainer):
 
         not_trainable_parameters = [p for p in self.policy.parameters() if not p.requires_grad]
         trainable_parameters = [(n, p) for n, p in self.policy.named_parameters() if p.requires_grad]
+        if self.successor_only and (not trainable_parameters or any(
+                '.successor.' not in name for name, _ in trainable_parameters)):
+            raise RuntimeError('E12 may only update the successor decoder')
         if getattr(self.config.GRPO, 'gauss_only', False):
             trainable_count = sum(p.numel() for _, p in trainable_parameters)
             if len(trainable_parameters) != 1 or trainable_count != 3840:
@@ -679,6 +702,18 @@ class RLTrainer(BaseVLNCETrainer):
             else:
                 print("\nThere are no extra network layers in the weight file.")
             print("="*75 + "\n")
+
+            if self.successor_only:
+                expected_missing = {
+                    'net.vln_bert.successor.' + name
+                    for name in vln_bert_module.successor.state_dict()
+                }
+                actual_missing = {
+                    key.replace('net.module.', 'net.')
+                    for key in incompatible_keys.missing_keys
+                }
+                if actual_missing != expected_missing or incompatible_keys.unexpected_keys:
+                    raise RuntimeError('E12 must start from a complete E0 with no successor weights')
 
             if getattr(self.config.GRPO, 'gauss_only', False):
                 invalid_missing = [
@@ -925,6 +960,9 @@ class RLTrainer(BaseVLNCETrainer):
         )
         logger.info(f"Agent parameters: {params/1e6:.2f} MB. Trainable: {params_t/1e6:.2f} MB.")
         logger.info("Finished setting up policy.")
+        if self.successor_only:
+            from vlnce_baselines.successor import decoder_digest
+            self.successor_initial_digest = decoder_digest(vln_bert_module.successor.state_dict())
         return start_iter
 
     def _vp_feature_variable(self, obs):
@@ -1140,7 +1178,15 @@ class RLTrainer(BaseVLNCETrainer):
                 )
             with torch.no_grad():
                 with autocast(enabled=self.enable_amp):
-                    self.sample_data(self.config.GRPO.sample_num)
+                    if self.successor_only:
+                        model = self.policy.net.vln_bert
+                        model.successor_sampling_base = True
+                        try:
+                            self.sample_data(self.config.GRPO.sample_num)
+                        finally:
+                            model.successor_sampling_base = False
+                    else:
+                        self.sample_data(self.config.GRPO.sample_num)
             self.update()
             self.training_iteration += 1
 
@@ -1153,6 +1199,11 @@ class RLTrainer(BaseVLNCETrainer):
     def update(self):
         if not self.data_buffer:
             logger.info("Data buffer is empty. Skipping update.")
+            return
+
+        if self.successor_only:
+            from vlnce_baselines.successor import update_successor
+            update_successor(self)
             return
 
         if getattr(self.config.GRPO, 'terminal_commit_only', False):
@@ -2190,6 +2241,20 @@ class RLTrainer(BaseVLNCETrainer):
             data_this_stepk["action"] = a_t.detach().cpu() 
             data_this_stepk["probs"] = nav_probs.detach().cpu() 
             data_this_stepk["indices"] = copy.deepcopy(not_done_index) 
+            if self.successor_only:
+                executed_move = [
+                    action != 0 and stepk < self.max_len - 1 and not no_vp_left[i]
+                    for i, action in enumerate(cpu_a_t)
+                ]
+                data_this_stepk['executed_move'] = torch.tensor(executed_move)
+                data_this_stepk['current_position'] = torch.tensor(
+                    np.asarray(cur_pos), dtype=torch.float32
+                )
+                data_this_stepk['successor_position'] = torch.tensor(np.asarray([
+                    self.gmaps[i].ghost_aug_pos[nav_inputs['gmap_vp_ids'][i][action]]
+                    if executed_move[i] else cur_pos[i]
+                    for i, action in enumerate(cpu_a_t)
+                ]), dtype=torch.float32)
             if frontier_advantage:
                 data_this_stepk['frontier_advantage'] = (
                     chosen_frontier_advantages
