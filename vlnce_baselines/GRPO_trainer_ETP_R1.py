@@ -111,7 +111,11 @@ class RLTrainer(BaseVLNCETrainer):
         self.instruction_coverage_only = getattr(
             config.GRPO, 'instruction_coverage_only', False
         )
+        self.landmark_transport_only = getattr(
+            config.GRPO, 'landmark_transport_only', False
+        )
         self.e13_optimizer_updates = 0
+        self.e14_optimizer_updates = 0
         self.scaler = GradScaler(enabled=self.enable_amp)
         print("config.GRPO:\n", config.GRPO)
         print(f"GRPO params: grpo_epsilon {self.grpo_epsilon}, grpo_beta {self.grpo_beta}, max_grad_norm {self.max_grad_norm}, grpo_update_epochs {self.grpo_update_epochs} \
@@ -130,6 +134,10 @@ class RLTrainer(BaseVLNCETrainer):
         elif self.instruction_coverage_only:
             experiment_metadata = {
                 'e13_optimizer_updates': self.e13_optimizer_updates
+            }
+        elif self.landmark_transport_only:
+            experiment_metadata = {
+                'e14_optimizer_updates': self.e14_optimizer_updates
             }
         else:
             experiment_metadata = {}
@@ -358,6 +366,7 @@ class RLTrainer(BaseVLNCETrainer):
                 self.config.GRPO, 'geo_token_only', False
             )
             instruction_coverage_only = self.instruction_coverage_only
+            landmark_transport_only = self.landmark_transport_only
             if success_set_commit and not terminal_commit_only:
                 raise ValueError(
                     'success_set_commit requires terminal_commit_only'
@@ -368,7 +377,7 @@ class RLTrainer(BaseVLNCETrainer):
                         anchor_repair_only, hindsight_stop_only,
                         terminal_commit_only, success_set_commit,
                         frontier_advantage, geo_token_only,
-                        instruction_coverage_only]):
+                        instruction_coverage_only, landmark_transport_only]):
                     raise ValueError(
                         'E9 cannot use E2-E8 training modes'
                     )
@@ -391,7 +400,7 @@ class RLTrainer(BaseVLNCETrainer):
                         anchor_repair_only, hindsight_stop_only,
                         terminal_commit_only, success_set_commit,
                         setwise_group_policy, geo_token_only,
-                        instruction_coverage_only]):
+                        instruction_coverage_only, landmark_transport_only]):
                     raise ValueError('E10 cannot use E2-E9 training modes')
                 if (self.config.GRPO.sample_num != 8 or
                         self.config.MODEL.task_type != 'r2r' or
@@ -410,7 +419,7 @@ class RLTrainer(BaseVLNCETrainer):
                     gauss_only, scorer_only, gaussian_bev_only,
                     anchor_repair_only, hindsight_stop_only,
                     terminal_commit_only, geo_token_only,
-                    instruction_coverage_only]) > 1:
+                    instruction_coverage_only, landmark_transport_only]) > 1:
                 raise ValueError(
                     'GRPO lightweight-only modes are mutually exclusive'
                 )
@@ -419,7 +428,7 @@ class RLTrainer(BaseVLNCETrainer):
                          anchor_repair_only, hindsight_stop_only,
                          terminal_commit_only, success_set_commit,
                          setwise_group_policy, frontier_advantage, geo_token_only,
-                         instruction_coverage_only]) or
+                         instruction_coverage_only, landmark_transport_only]) or
                         vln_bert_module.successor is None or
                         self.config.GPU_NUMBERS != 1 or self.enable_amp or
                         self.enable_all_dropouts or self.dropout_in_sampling or
@@ -428,6 +437,42 @@ class RLTrainer(BaseVLNCETrainer):
                         self.config.GRPO.is_requeue):
                     raise ValueError('E12 requires independent, single-GPU, dropout-free control training')
                 self.trainable_parts = [vln_bert_module.successor]
+            elif landmark_transport_only:
+                transport = vln_bert_module.landmark_transport
+                if transport is None:
+                    raise ValueError(
+                        'landmark_transport_only requires '
+                        'MODEL.landmark_transport_size > 0'
+                    )
+                if (self.config.GRPO.sample_num != 8 or
+                        self.config.GRPO.update_epochs != 1 or
+                        self.config.GRPO.batch_size != 1 or
+                        abs(self.config.GRPO.lr - 1e-4) > 1e-12 or
+                        abs(self.config.GRPO.grpo_beta - 0.04) > 1e-12 or
+                        self.config.MODEL.task_type != 'r2r' or
+                        self.config.MODEL.gauss_feat_size != 0 or
+                        self.config.MODEL.candidate_scorer_hidden_size != 0 or
+                        self.config.MODEL.gaussian_bev_hidden_size != 0 or
+                        self.config.MODEL.anchor_repair_hidden_size != 0 or
+                        self.config.MODEL.hindsight_stop_hidden_size != 0 or
+                        self.config.MODEL.terminal_commit_hidden_size != 0 or
+                        self.config.MODEL.geo_token_hidden_size != 0 or
+                        self.config.MODEL.successor_hidden_size != 0 or
+                        self.config.MODEL.instruction_coverage_hidden_size != 0 or
+                        self.config.MODEL.landmark_transport_size != 128 or
+                        success_set_commit or setwise_group_policy or
+                        frontier_advantage or self.config.GPU_NUMBERS != 1 or
+                        self.enable_amp or self.enable_all_dropouts or
+                        self.dropout_in_sampling or
+                        self.config.GRPO.waypoint_aug or
+                        self.config.GRPO.back_algo != 'control' or
+                        self.config.GRPO.is_requeue):
+                    raise ValueError(
+                        'E14 requires strict E0, R2R, sample_num=8, a '
+                        '128-wide transport, and independent single-GPU '
+                        'dropout-free control training'
+                    )
+                self.trainable_parts = [transport]
             elif instruction_coverage_only:
                 coverage = vln_bert_module.instruction_coverage
                 if coverage is None:
@@ -611,6 +656,18 @@ class RLTrainer(BaseVLNCETrainer):
             if invalid_names or trainable_count != 449:
                 raise RuntimeError(
                     'E13 expected exactly 449 instruction-coverage '
+                    'parameters, got invalid=%s and %d parameters' %
+                    (invalid_names, trainable_count)
+                )
+        if self.landmark_transport_only:
+            trainable_count = sum(p.numel() for _, p in trainable_parameters)
+            invalid_names = [
+                name for name, _ in trainable_parameters
+                if '.landmark_transport.' not in name
+            ]
+            if invalid_names or trainable_count != 590848:
+                raise RuntimeError(
+                    'E14 expected exactly 590,848 landmark-transport '
                     'parameters, got invalid=%s and %d parameters' %
                     (invalid_names, trainable_count)
                 )
@@ -801,6 +858,23 @@ class RLTrainer(BaseVLNCETrainer):
                         'weights'
                     )
                 vln_bert_module.instruction_coverage.reset_output()
+
+            if self.landmark_transport_only:
+                expected_missing = {
+                    'net.vln_bert.landmark_transport.' + name
+                    for name in vln_bert_module.landmark_transport.state_dict()
+                }
+                actual_missing = {
+                    key.replace('net.module.', 'net.')
+                    for key in incompatible_keys.missing_keys
+                }
+                if (actual_missing != expected_missing or
+                        incompatible_keys.unexpected_keys):
+                    raise RuntimeError(
+                        'E14 must start from a complete E0 with no transport '
+                        'weights'
+                    )
+                vln_bert_module.landmark_transport.reset_output()
 
             if getattr(self.config.GRPO, 'gauss_only', False):
                 invalid_missing = [
@@ -1093,6 +1167,7 @@ class RLTrainer(BaseVLNCETrainer):
         batch_gmap_img_fts, batch_gmap_pos_fts = [], []
         batch_gmap_pair_dists, batch_gmap_visited_masks = [], []
         batch_gmap_instruction_evidence = []
+        batch_gmap_transport_views = []
         batch_no_vp_left = []
         batch_gmap_task_embeddings = []
 
@@ -1152,6 +1227,13 @@ class RLTrainer(BaseVLNCETrainer):
                 batch_gmap_instruction_evidence.append(torch.stack([
                     torch.zeros_like(instruction_evidence[0])
                 ] + instruction_evidence))
+            if gmap.transport_memory:
+                batch_gmap_transport_views.append([
+                    None
+                ] + [
+                    gmap.get_transport_views(vp)
+                    for vp in node_vp_ids + ghost_vp_ids
+                ])
         
         batch_gmap_step_ids = pad_sequence(batch_gmap_step_ids, batch_first=True).cuda()
         batch_gmap_task_embeddings = pad_sequence(batch_gmap_task_embeddings, batch_first=True).cuda()
@@ -1178,6 +1260,26 @@ class RLTrainer(BaseVLNCETrainer):
             outputs['gmap_instruction_evidence'] = pad_tensors_wgrad(
                 batch_gmap_instruction_evidence
             )
+        if batch_gmap_transport_views:
+            max_sources = max(
+                views.size(0)
+                for graph_views in batch_gmap_transport_views
+                for views in graph_views if views is not None
+            )
+            example = batch_gmap_transport_views[0][1]
+            transport_views = torch.zeros(
+                bs, max_gmap_len, max_sources, example.size(1),
+                dtype=example.dtype,
+            )
+            transport_masks = torch.zeros(
+                bs, max_gmap_len, max_sources, dtype=torch.bool
+            )
+            for i, graph_views in enumerate(batch_gmap_transport_views):
+                for j, views in enumerate(graph_views[1:], 1):
+                    transport_views[i, j, :views.size(0)] = views
+                    transport_masks[i, j, :views.size(0)] = True
+            outputs['gmap_transport_views'] = transport_views.cuda()
+            outputs['gmap_transport_masks'] = transport_masks.cuda()
         return outputs
 
     def train(self):
@@ -1409,6 +1511,17 @@ class RLTrainer(BaseVLNCETrainer):
                 intervention_count / max(decision_count, 1)
             )
 
+        if self.landmark_transport_only:
+            transport_count = sum(
+                sample['transport_count'] for sample in self.data_buffer
+            )
+            self.logs['transport_entropy'].append(sum(
+                sample['transport_entropy_sum'] for sample in self.data_buffer
+            ) / max(transport_count, 1))
+            self.logs['transport_residual_norm'].append(sum(
+                sample['transport_residual_sum'] for sample in self.data_buffer
+            ) / max(transport_count, 1))
+
         if self.instruction_coverage_only:
             coverage_sum = sum(
                 sample['coverage_sum'] for sample in self.data_buffer
@@ -1491,6 +1604,8 @@ class RLTrainer(BaseVLNCETrainer):
 
         total_processed_actions_for_ratio = 0
         total_unclipped_actions = 0
+        transport_interventions = 0
+        transport_decisions = 0
 
         # --- 2. Multi-epoch training loop over the same data buffer ---
         for epoch in range(self.grpo_update_epochs):
@@ -1550,6 +1665,14 @@ class RLTrainer(BaseVLNCETrainer):
                         if self.need_ref_policy:
                             with torch.no_grad():
                                 ref_policy_outputs = self.ref_policy.net(**nav_inputs_cuda)
+                            if self.landmark_transport_only:
+                                transport_interventions += (
+                                    current_policy_outputs['global_logits'].argmax(1) !=
+                                    ref_policy_outputs['global_logits'].argmax(1)
+                                ).sum().item()
+                                transport_decisions += (
+                                    current_policy_outputs['global_logits'].size(0)
+                                )
 
                         with autocast(enabled=False):
                             current_logits = current_policy_outputs['global_logits']
@@ -1685,6 +1808,11 @@ class RLTrainer(BaseVLNCETrainer):
         if actual_epochs_processed > 0:
             if self.instruction_coverage_only:
                 self.e13_optimizer_updates += 1
+            if self.landmark_transport_only:
+                self.e14_optimizer_updates += 1
+                self.logs['intervention_rate'].append(
+                    transport_interventions / max(transport_decisions, 1)
+                )
             self.logs['policy_loss'].append(total_policy_loss_across_epochs / actual_epochs_processed)
             if self.need_ref_policy:
                 self.logs['kl_loss'].append(total_kl_loss_across_epochs / actual_epochs_processed)
@@ -2114,6 +2242,9 @@ class RLTrainer(BaseVLNCETrainer):
             "marginal_count": 0,
             "residual_abs_sum": 0.0,
             "residual_count": 0,
+            "transport_entropy_sum": 0.0,
+            "transport_residual_sum": 0.0,
+            "transport_count": 0,
             "success": [None] * self.envs.num_envs,
             "oracle_success": [None] * self.envs.num_envs,
             "setwise_outcome": [None] * self.envs.num_envs,
@@ -2138,7 +2269,11 @@ class RLTrainer(BaseVLNCETrainer):
                                        self.config.MODEL,
                                        'instruction_coverage_hidden_size', 0
                                    ) > 0 else 0
-                               )) for _ in range(self.envs.num_envs)]
+                               ),
+                               transport_memory=getattr(
+                                   self.config.MODEL,
+                                   'landmark_transport_size', 0
+                               ) > 0) for _ in range(self.envs.num_envs)]
         prev_vp = [None] * self.envs.num_envs
         path_lengths = [0.0] * self.envs.num_envs
         shortest_path_lengths = [None] * self.envs.num_envs
@@ -2220,6 +2355,14 @@ class RLTrainer(BaseVLNCETrainer):
                         if current_instruction_evidence is not None else None
                     ),
                     cand_instruction_evidence=cand_instruction_evidence,
+                    cur_transport_views=(
+                        pano_embeds[i][pano_masks[i]]
+                        if self.gmaps[i].transport_memory else None
+                    ),
+                    cand_transport_views=(
+                        cand_embeds
+                        if self.gmaps[i].transport_memory else None
+                    ),
                 ))
 
             if hindsight_stop_only or terminal_commit_only:
@@ -2308,6 +2451,14 @@ class RLTrainer(BaseVLNCETrainer):
 
             nav_inputs_copy_for_cpu = self.copy_nav_inputs_dict(nav_inputs)
             nav_outs = self.policy.net(**nav_inputs_for_gpu)
+            if self.landmark_transport_only:
+                data_this_sample['transport_entropy_sum'] += (
+                    nav_outs['transport_entropy'].item()
+                )
+                data_this_sample['transport_residual_sum'] += (
+                    nav_outs['transport_residual_norm'].item()
+                )
+                data_this_sample['transport_count'] += 1
             if self.instruction_coverage_only:
                 frontier_masks = (
                     nav_inputs['gmap_masks'] &

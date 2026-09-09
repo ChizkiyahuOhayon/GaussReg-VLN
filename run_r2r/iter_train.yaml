@@ -108,6 +108,7 @@ GRPO:
   frontier_advantage: False
   geo_token_only: False
   instruction_coverage_only: False
+  landmark_transport_only: False
   frontier_advantage_start: 1.0
   frontier_advantage_end: 0.25
   frontier_progress_clip: 3.0
@@ -135,6 +136,7 @@ MODEL:
   terminal_commit_hidden_size: 0
   geo_token_hidden_size: 0
   instruction_coverage_hidden_size: 0
+  landmark_transport_size: 0
   merge_ghost: True
   consume_ghost: True
   

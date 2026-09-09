@@ -143,7 +143,8 @@ class GraphMap(object):
     GAUSS_MAX_STD = 3.0
 
     def __init__(self, has_real_pos, loc_noise, merge_ghost, ghost_aug,
-                 gauss_feat_size=0, instruction_evidence_size=0):
+                 gauss_feat_size=0, instruction_evidence_size=0,
+                 transport_memory=False):
         if gauss_feat_size not in (0, self.GAUSS_FEAT_SIZE):
             raise ValueError(
                 'gauss_feat_size must be 0 or %d, got %s' %
@@ -156,12 +157,14 @@ class GraphMap(object):
 
         self.gauss_feat_size = gauss_feat_size
         self.instruction_evidence_size = instruction_evidence_size
+        self.transport_memory = transport_memory
 
         self.graph_nx = nx.Graph()
 
         self.node_pos = {}          # viewpoint to position (x, y, z)
         self.node_embeds = {}       # viewpoint to pano feature
         self.node_instruction_evidence = {}
+        self.node_transport_views = {}
         self.node_stepId = {}
 
         self.ghost_cnt = 0          # id to create ghost 
@@ -169,6 +172,7 @@ class GraphMap(object):
         self.ghost_mean_pos = {}
         self.ghost_embeds = {}      # viewpoint to single_view feature
         self.ghost_instruction_evidence = {}
+        self.ghost_transport_views = {}
         self.ghost_fronts = {}      # viewpoint to front_vp id
         self.ghost_real_pos = {}    # for training
         self.has_real_pos = has_real_pos
@@ -210,6 +214,8 @@ class GraphMap(object):
         self.ghost_fronts.pop(vp)
         if self.instruction_evidence_size:
             self.ghost_instruction_evidence.pop(vp)
+        if self.transport_memory:
+            self.ghost_transport_views.pop(vp)
         if self.has_real_pos:
             self.ghost_real_pos.pop(vp)
 
@@ -218,7 +224,9 @@ class GraphMap(object):
                            cand_vp, cand_pos, cand_embeds, 
                            cand_real_pos,
                            cur_instruction_evidence=None,
-                           cand_instruction_evidence=None):
+                           cand_instruction_evidence=None,
+                           cur_transport_views=None,
+                           cand_transport_views=None):
         if self.instruction_evidence_size:
             expected = (self.instruction_evidence_size,)
             if (cur_instruction_evidence is None or
@@ -227,6 +235,12 @@ class GraphMap(object):
                     tuple(cand_instruction_evidence.shape) !=
                     (len(cand_vp), self.instruction_evidence_size)):
                 raise ValueError('Instruction evidence is missing or misaligned')
+        if self.transport_memory and (
+                cur_transport_views is None or cur_transport_views.ndim != 2 or
+                cand_transport_views is None or cand_transport_views.ndim != 2 or
+                cand_transport_views.size(0) != len(cand_vp) or
+                cur_transport_views.size(1) != cand_transport_views.size(1)):
+            raise ValueError('Transport views are missing or misaligned')
         # 1. connect prev_vp
         self.graph_nx.add_node(cur_vp)
         if prev_vp is not None:
@@ -240,6 +254,10 @@ class GraphMap(object):
         if self.instruction_evidence_size:
             self.node_instruction_evidence[cur_vp] = (
                 cur_instruction_evidence.detach().clone()
+            )
+        if self.transport_memory:
+            self.node_transport_views[cur_vp] = (
+                cur_transport_views.detach().cpu().clone()
             )
         self.node_stepId[cur_vp] = step_id
         candidate_targets = []
@@ -265,6 +283,10 @@ class GraphMap(object):
                             self.ghost_instruction_evidence[gvp] = (
                                 cand_instruction_evidence[i].detach().clone()
                             )
+                        if self.transport_memory:
+                            self.ghost_transport_views[gvp] = (
+                                cand_transport_views[i:i + 1].detach().cpu().clone()
+                            )
                         self.ghost_fronts[gvp] = [cur_vp]
                         if self.has_real_pos:
                             self.ghost_real_pos[gvp] = [cand_real_pos[i]]
@@ -280,6 +302,11 @@ class GraphMap(object):
                                 self.ghost_instruction_evidence[gvp],
                                 cand_instruction_evidence[i].detach(),
                             )
+                        if self.transport_memory:
+                            self.ghost_transport_views[gvp] = torch.cat([
+                                self.ghost_transport_views[gvp],
+                                cand_transport_views[i:i + 1].detach().cpu(),
+                            ], dim=0)
                         self.ghost_fronts[gvp].append(cur_vp)
                         if self.has_real_pos:
                             self.ghost_real_pos[gvp].append(cand_real_pos[i])
@@ -292,6 +319,10 @@ class GraphMap(object):
                     if self.instruction_evidence_size:
                         self.ghost_instruction_evidence[gvp] = (
                             cand_instruction_evidence[i].detach().clone()
+                        )
+                    if self.transport_memory:
+                        self.ghost_transport_views[gvp] = (
+                            cand_transport_views[i:i + 1].detach().cpu().clone()
                         )
                     self.ghost_fronts[gvp] = [cur_vp]
                     if self.has_real_pos:
@@ -335,6 +366,13 @@ class GraphMap(object):
         if vp.startswith('g'):
             return self.ghost_instruction_evidence[vp]
         return self.node_instruction_evidence[vp]
+
+    def get_transport_views(self, vp):
+        if not self.transport_memory:
+            raise RuntimeError('Transport memory is disabled')
+        if vp.startswith('g'):
+            return self.ghost_transport_views[vp]
+        return self.node_transport_views[vp]
 
     def get_pos_fts(self, cur_vp, cur_pos, cur_ori, gmap_vp_ids):
         rel_angles, rel_dists = [], []

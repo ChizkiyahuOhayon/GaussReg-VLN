@@ -293,7 +293,8 @@ class RLTrainer(BaseVLNCETrainer):
                 incompatible_keys = self.policy.load_state_dict(ckpt_dict["state_dict"], strict=False)
             exact_experiment_checkpoint = (
                 getattr(config.MODEL, 'successor_hidden_size', 0) or
-                getattr(config.MODEL, 'instruction_coverage_hidden_size', 0)
+                getattr(config.MODEL, 'instruction_coverage_hidden_size', 0) or
+                getattr(config.MODEL, 'landmark_transport_size', 0)
             )
             if exact_experiment_checkpoint and (
                     incompatible_keys.missing_keys or incompatible_keys.unexpected_keys):
@@ -431,6 +432,7 @@ class RLTrainer(BaseVLNCETrainer):
         batch_gmap_img_fts, batch_gmap_pos_fts = [], []
         batch_gmap_pair_dists, batch_gmap_visited_masks = [], []
         batch_gmap_instruction_evidence = []
+        batch_gmap_transport_views = []
         batch_no_vp_left = []
         batch_gmap_task_embeddings = []
 
@@ -490,6 +492,13 @@ class RLTrainer(BaseVLNCETrainer):
                 batch_gmap_instruction_evidence.append(torch.stack([
                     torch.zeros_like(instruction_evidence[0])
                 ] + instruction_evidence))
+            if gmap.transport_memory:
+                batch_gmap_transport_views.append([
+                    None
+                ] + [
+                    gmap.get_transport_views(vp)
+                    for vp in node_vp_ids + ghost_vp_ids
+                ])
         
         batch_gmap_step_ids = pad_sequence(batch_gmap_step_ids, batch_first=True).cuda()
         batch_gmap_task_embeddings = pad_sequence(batch_gmap_task_embeddings, batch_first=True).cuda()
@@ -516,6 +525,26 @@ class RLTrainer(BaseVLNCETrainer):
             outputs['gmap_instruction_evidence'] = pad_tensors_wgrad(
                 batch_gmap_instruction_evidence
             )
+        if batch_gmap_transport_views:
+            max_sources = max(
+                views.size(0)
+                for graph_views in batch_gmap_transport_views
+                for views in graph_views if views is not None
+            )
+            example = batch_gmap_transport_views[0][1]
+            transport_views = torch.zeros(
+                bs, max_gmap_len, max_sources, example.size(1),
+                dtype=example.dtype,
+            )
+            transport_masks = torch.zeros(
+                bs, max_gmap_len, max_sources, dtype=torch.bool
+            )
+            for i, graph_views in enumerate(batch_gmap_transport_views):
+                for j, views in enumerate(graph_views[1:], 1):
+                    transport_views[i, j, :views.size(0)] = views
+                    transport_masks[i, j, :views.size(0)] = True
+            outputs['gmap_transport_views'] = transport_views.cuda()
+            outputs['gmap_transport_masks'] = transport_masks.cuda()
         return outputs
 
     def _history_variable(self, obs):
@@ -958,7 +987,11 @@ class RLTrainer(BaseVLNCETrainer):
                                        self.config.MODEL,
                                        'instruction_coverage_hidden_size', 0
                                    ) > 0 else 0
-                               )) for _ in range(self.envs.num_envs)]
+                               ),
+                               transport_memory=getattr(
+                                   self.config.MODEL,
+                                   'landmark_transport_size', 0
+                               ) > 0) for _ in range(self.envs.num_envs)]
         prev_vp = [None] * self.envs.num_envs
 
         for stepk in range(self.max_len): 
@@ -1037,6 +1070,14 @@ class RLTrainer(BaseVLNCETrainer):
                         if current_instruction_evidence is not None else None
                     ),
                     cand_instruction_evidence=cand_instruction_evidence,
+                    cur_transport_views=(
+                        pano_embeds[i][pano_masks[i]]
+                        if self.gmaps[i].transport_memory else None
+                    ),
+                    cand_transport_views=(
+                        cand_embeds
+                        if self.gmaps[i].transport_memory else None
+                    ),
                 ))
 
             nav_inputs = self._nav_gmap_variable(cur_vp, cur_pos, cur_ori, task_type)

@@ -173,6 +173,7 @@ class ETP(Net):
                 gmap_geo_tokens=None, gmap_geo_masks=None,
                 view_embeds=None, view_masks=None,
                 gmap_instruction_evidence=None,
+                gmap_transport_views=None, gmap_transport_masks=None,
                 successor_override=None):
 
         if mode == 'language':
@@ -411,6 +412,7 @@ class ETP(Net):
                 gmap_task_embeddings, gmap_stop_scores,
                 gmap_geo_tokens, gmap_geo_masks,
                 gmap_instruction_evidence,
+                gmap_transport_views, gmap_transport_masks,
                 successor_override,
             )
             return outs

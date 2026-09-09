@@ -1314,6 +1314,22 @@ class GlocalTextPathNavCMT(BertPreTrainedModel):
             from vlnce_baselines.successor import SuccessorDecoder
             self.successor = SuccessorDecoder(config.hidden_size, successor_size)
 
+        self.landmark_transport = None
+        transport_size = getattr(config, 'landmark_transport_size', 0)
+        if transport_size:
+            if (any([self.candidate_scorer, self.gaussian_bev,
+                     self.anchor_repair, self.hindsight_stop,
+                     self.terminal_commit, self.geo_token,
+                     self.instruction_coverage, self.successor]) or
+                    getattr(config, 'gauss_feat_size', 0)):
+                raise ValueError(
+                    'landmark transport and E2-E13 modules are mutually exclusive'
+                )
+            from vlnce_baselines.landmark_transport import LandmarkTransport
+            self.landmark_transport = LandmarkTransport(
+                config.hidden_size, transport_size
+            )
+
         self.init_weights()
         if self.global_encoder.gmap_gauss_embedding is not None:
             nn.init.zeros_(self.global_encoder.gmap_gauss_embedding.weight)
@@ -1331,6 +1347,8 @@ class GlocalTextPathNavCMT(BertPreTrainedModel):
             self.geo_token.reset_output()
         if self.instruction_coverage is not None:
             self.instruction_coverage.reset_output()
+        if self.landmark_transport is not None:
+            self.landmark_transport.reset_output()
         
         if config.fix_lang_embedding:
             print("FIX LANG EMBEDDING!!!!!!!!!!!!!!!!!!!!!!!!")
@@ -1412,6 +1430,7 @@ class GlocalTextPathNavCMT(BertPreTrainedModel):
         gmap_stop_scores=None,
         gmap_geo_tokens=None, gmap_geo_masks=None,
         gmap_instruction_evidence=None,
+        gmap_transport_views=None, gmap_transport_masks=None,
         successor_override=None,
     ):
         # global branch
@@ -1424,6 +1443,18 @@ class GlocalTextPathNavCMT(BertPreTrainedModel):
                       self.global_encoder.gmap_step_embeddings(gmap_step_ids) + \
                       task_type_encoding + \
                       self.global_encoder.position_embedding(gmap_pos_fts)
+
+        transport_diagnostics = None
+        if self.landmark_transport is not None:
+            if gmap_transport_views is None or gmap_transport_masks is None:
+                raise ValueError(
+                    'landmark transport requires aligned prepool graph views'
+                )
+            transport_residual, transport_diagnostics = self.landmark_transport(
+                gmap_transport_views, gmap_transport_masks,
+                txt_embeds, txt_masks,
+            )
+            gmap_embeds = gmap_embeds + transport_residual
 
         action_slots = gmap_embeds.size(1)
         encoder_masks = gmap_masks
@@ -1545,4 +1576,9 @@ class GlocalTextPathNavCMT(BertPreTrainedModel):
             outs['instruction_coverage'] = coverage
             outs['instruction_marginal'] = marginal
             outs['instruction_coverage_residual'] = coverage_residual
+        if transport_diagnostics is not None:
+            outs['transport_entropy'] = transport_diagnostics['entropy']
+            outs['transport_residual_norm'] = transport_diagnostics[
+                'residual_norm'
+            ]
         return outs

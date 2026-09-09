@@ -69,6 +69,9 @@ def get_vlnbert_models(config=None, dropout_rate=0.1):
     vis_config.instruction_coverage_hidden_size = getattr(
         config, 'instruction_coverage_hidden_size', 0
     )
+    vis_config.landmark_transport_size = getattr(
+        config, 'landmark_transport_size', 0
+    )
 
     vis_config.num_l_layers = 12
     vis_config.num_pano_layers = 2
@@ -148,4 +151,11 @@ def get_vlnbert_models(config=None, dropout_rate=0.1):
             not has_instruction_coverage):
         # from_pretrained reinitializes missing keys after model.__init__.
         visual_model.instruction_coverage.reset_output()
+    has_landmark_transport = any(
+        'landmark_transport.' in key for key in new_ckpt_weights
+    )
+    if (visual_model.landmark_transport is not None and
+            not has_landmark_transport):
+        # from_pretrained reinitializes missing keys after model.__init__.
+        visual_model.landmark_transport.reset_output()
     return visual_model
