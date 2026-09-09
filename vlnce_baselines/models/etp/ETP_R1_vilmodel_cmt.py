@@ -1330,6 +1330,23 @@ class GlocalTextPathNavCMT(BertPreTrainedModel):
                 config.hidden_size, transport_size
             )
 
+        self.factorized_landmark = None
+        factorized_size = getattr(config, 'factorized_landmark_size', 0)
+        if factorized_size:
+            if (any([self.candidate_scorer, self.gaussian_bev,
+                     self.anchor_repair, self.hindsight_stop,
+                     self.terminal_commit, self.geo_token,
+                     self.instruction_coverage, self.successor,
+                     self.landmark_transport]) or
+                    getattr(config, 'gauss_feat_size', 0)):
+                raise ValueError(
+                    'factorized landmark routing requires E2-E14 modules off'
+                )
+            from vlnce_baselines.landmark_transport import LandmarkTransport
+            self.factorized_landmark = LandmarkTransport(
+                config.hidden_size, factorized_size
+            )
+
         self.init_weights()
         if self.global_encoder.gmap_gauss_embedding is not None:
             nn.init.zeros_(self.global_encoder.gmap_gauss_embedding.weight)
@@ -1349,6 +1366,8 @@ class GlocalTextPathNavCMT(BertPreTrainedModel):
             self.instruction_coverage.reset_output()
         if self.landmark_transport is not None:
             self.landmark_transport.reset_output()
+        if self.factorized_landmark is not None:
+            self.factorized_landmark.reset_output()
         
         if config.fix_lang_embedding:
             print("FIX LANG EMBEDDING!!!!!!!!!!!!!!!!!!!!!!!!")
@@ -1435,6 +1454,7 @@ class GlocalTextPathNavCMT(BertPreTrainedModel):
     ):
         # global branch
         batch_size = gmap_task_embeddings.size(0)
+        transport_txt_embeds = txt_embeds
         task_type_encoding = self.global_encoder.gmap_task_embeddings(gmap_task_embeddings)
         if self.global_encoder.training:
             gmap_keep_mask = (torch.rand((batch_size, 1, 1), device=gmap_task_embeddings.device) > self.global_encoder.task_embedding_dropout_prob).float()
@@ -1508,6 +1528,73 @@ class GlocalTextPathNavCMT(BertPreTrainedModel):
         global_logits.masked_fill_(gmap_masks.logical_not(), -float('inf'))
 
         base_global_logits = global_logits
+        factorized_diagnostics = None
+        factorized_greedy_actions = None
+        if self.factorized_landmark is not None:
+            if gmap_transport_views is None or gmap_transport_masks is None:
+                raise ValueError(
+                    'factorized landmark routing requires aligned prepool views'
+                )
+            from vlnce_baselines.factorized_landmark import (
+                conditional_frontier_kl,
+                factorized_action_log_probs,
+                factorized_greedy_actions as select_greedy_actions,
+                frontier_action_mask,
+            )
+            transport_residual, transport_diagnostics = (
+                self.factorized_landmark(
+                    gmap_transport_views,
+                    gmap_transport_masks,
+                    transport_txt_embeds,
+                    txt_masks,
+                )
+            )
+            frontier_masks = frontier_action_mask(
+                gmap_masks, gmap_visited_masks
+            )
+            routed_gmap_embeds = gmap_embeds + transport_residual * (
+                frontier_masks.unsqueeze(-1).to(transport_residual.dtype)
+            )
+            routed_text, _ = self.graph_query_text(
+                routed_gmap_embeds,
+                txt_embeds,
+                attention_mask=extended_txt_masks,
+            )
+            routed_text = self.graph_attentioned_txt_embeds_transform(
+                routed_text
+            )
+            routed_logits = self.global_sap_head(torch.cat([
+                routed_gmap_embeds, routed_text
+            ], dim=-1)).squeeze(2)
+            routed_logits.masked_fill_(
+                frontier_masks.logical_not(), -float('inf')
+            )
+            global_logits = factorized_action_log_probs(
+                base_global_logits, routed_logits, frontier_masks
+            )
+            factorized_greedy_actions = select_greedy_actions(
+                base_global_logits, routed_logits, frontier_masks
+            )
+            active = frontier_masks.any(dim=-1)
+            base_frontier_actions = base_global_logits.masked_fill(
+                frontier_masks.logical_not(), -float('inf')
+            ).argmax(dim=-1)
+            routed_frontier_actions = routed_logits.argmax(dim=-1)
+            factorized_diagnostics = {
+                'conditional_kl': conditional_frontier_kl(
+                    base_global_logits, routed_logits, frontier_masks
+                ).detach(),
+                'frontier_intervention': (
+                    (base_frontier_actions != routed_frontier_actions)[active]
+                    .float().mean().detach()
+                    if active.any() else global_logits.new_zeros(())
+                ),
+                'entropy': transport_diagnostics['entropy'],
+                'residual_norm': (
+                    transport_residual.norm(dim=-1)[frontier_masks].mean().detach()
+                    if frontier_masks.any() else global_logits.new_zeros(())
+                ),
+            }
         coverage = None
         marginal = None
         coverage_residual = None
@@ -1566,7 +1653,8 @@ class GlocalTextPathNavCMT(BertPreTrainedModel):
         if (self.anchor_repair is not None or
                 self.hindsight_stop is not None or
                 self.terminal_commit is not None or
-                self.instruction_coverage is not None):
+                self.instruction_coverage is not None or
+                self.factorized_landmark is not None):
             outs['base_global_logits'] = base_global_logits
         if hindsight_stop_logits is not None:
             outs['hindsight_stop_logits'] = hindsight_stop_logits
@@ -1579,6 +1667,18 @@ class GlocalTextPathNavCMT(BertPreTrainedModel):
         if transport_diagnostics is not None:
             outs['transport_entropy'] = transport_diagnostics['entropy']
             outs['transport_residual_norm'] = transport_diagnostics[
+                'residual_norm'
+            ]
+        if factorized_diagnostics is not None:
+            outs['factorized_greedy_actions'] = factorized_greedy_actions
+            outs['conditional_frontier_kl'] = factorized_diagnostics[
+                'conditional_kl'
+            ]
+            outs['frontier_intervention_rate'] = factorized_diagnostics[
+                'frontier_intervention'
+            ]
+            outs['transport_entropy'] = factorized_diagnostics['entropy']
+            outs['transport_residual_norm'] = factorized_diagnostics[
                 'residual_norm'
             ]
         return outs

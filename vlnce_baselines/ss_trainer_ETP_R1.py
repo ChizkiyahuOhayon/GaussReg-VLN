@@ -294,7 +294,8 @@ class RLTrainer(BaseVLNCETrainer):
             exact_experiment_checkpoint = (
                 getattr(config.MODEL, 'successor_hidden_size', 0) or
                 getattr(config.MODEL, 'instruction_coverage_hidden_size', 0) or
-                getattr(config.MODEL, 'landmark_transport_size', 0)
+                getattr(config.MODEL, 'landmark_transport_size', 0) or
+                getattr(config.MODEL, 'factorized_landmark_size', 0)
             )
             if exact_experiment_checkpoint and (
                     incompatible_keys.missing_keys or incompatible_keys.unexpected_keys):
@@ -991,6 +992,9 @@ class RLTrainer(BaseVLNCETrainer):
                                transport_memory=getattr(
                                    self.config.MODEL,
                                    'landmark_transport_size', 0
+                               ) > 0 or getattr(
+                                   self.config.MODEL,
+                                   'factorized_landmark_size', 0
                                ) > 0) for _ in range(self.envs.num_envs)]
         prev_vp = [None] * self.envs.num_envs
 
@@ -1131,7 +1135,9 @@ class RLTrainer(BaseVLNCETrainer):
                 a_t = torch.where(torch.rand_like(a_t, dtype=torch.float)<=sample_ratio, teacher_actions, a_t)
 
             elif feedback == 'argmax':
-                a_t = nav_logits.argmax(dim=-1)
+                a_t = nav_outs.get(
+                    'factorized_greedy_actions', nav_logits.argmax(dim=-1)
+                )
             else:
                 raise NotImplementedError
             if mode != 'train' and 'hindsight_stop_logits' in nav_outs:

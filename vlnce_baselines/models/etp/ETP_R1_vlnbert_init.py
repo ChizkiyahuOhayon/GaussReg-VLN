@@ -72,6 +72,9 @@ def get_vlnbert_models(config=None, dropout_rate=0.1):
     vis_config.landmark_transport_size = getattr(
         config, 'landmark_transport_size', 0
     )
+    vis_config.factorized_landmark_size = getattr(
+        config, 'factorized_landmark_size', 0
+    )
 
     vis_config.num_l_layers = 12
     vis_config.num_pano_layers = 2
@@ -158,4 +161,11 @@ def get_vlnbert_models(config=None, dropout_rate=0.1):
             not has_landmark_transport):
         # from_pretrained reinitializes missing keys after model.__init__.
         visual_model.landmark_transport.reset_output()
+    has_factorized_landmark = any(
+        'factorized_landmark.' in key for key in new_ckpt_weights
+    )
+    if (visual_model.factorized_landmark is not None and
+            not has_factorized_landmark):
+        # from_pretrained reinitializes missing keys after model.__init__.
+        visual_model.factorized_landmark.reset_output()
     return visual_model
