@@ -45,6 +45,9 @@ evaluation environments, and base distributed port. The runner executes:
 4. independent 500-iteration training from E0 and checkpoint validation;
 5. one 1,839-episode R2R-CE `val_unseen` evaluation and six-metric gate.
 
+Each training arm writes only its final checkpoint. This bounds checkpoint
+storage to one 20-iteration file and one 500-iteration file.
+
 The fixed training recipe uses eight rollouts, one update epoch, AdamW learning
 rate `1e-4`, KL coefficient `0.04`, no AMP/dropout/waypoint augmentation, and
 the `control` back algorithm. No E13 or 20-iteration checkpoint is reused.

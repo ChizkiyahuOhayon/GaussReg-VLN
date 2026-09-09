@@ -127,6 +127,9 @@ class RLTrainer(BaseVLNCETrainer):
                 self._make_results_dir()
 
     def save_checkpoint(self, iteration: int):
+        if (self.landmark_transport_only and
+                iteration != self.config.GRPO.iters):
+            return
         if self.successor_only:
             experiment_metadata = {
                 'e12_initial_decoder_sha256': self.successor_initial_digest

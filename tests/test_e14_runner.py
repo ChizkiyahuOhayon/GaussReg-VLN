@@ -11,6 +11,12 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def test_e14_only_writes_the_final_training_checkpoint():
+    source = (ROOT / 'vlnce_baselines/GRPO_trainer_ETP_R1.py').read_text()
+    assert ('self.landmark_transport_only and\n'
+            '                iteration != self.config.GRPO.iters' in source)
+
+
 def _run(tmp_path, fail20=False):
     (tmp_path / 'run_r2r').mkdir()
     shutil.copyfile(ROOT / 'run_r2r/e14_closed_loop_1gpu.bash',
