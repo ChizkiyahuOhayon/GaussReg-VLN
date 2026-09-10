@@ -19,6 +19,14 @@ def conditional_probabilities(logits, masks):
     return torch.softmax(masked, dim=-1)
 
 
+def probability_mismatch(log_probs, base_logits):
+    """Return behavior-space error and a dtype-scaled FP tolerance."""
+    expected = torch.softmax(base_logits, dim=-1)
+    mismatch = (log_probs.exp() - expected).abs().max().item()
+    tolerance = 8 * torch.finfo(log_probs.dtype).eps
+    return mismatch, tolerance
+
+
 def exercise_model(model):
     torch.manual_seed(16)
     model.eval()
@@ -38,11 +46,22 @@ def exercise_model(model):
         })['global_logits']
         model.factorized_landmark = transport
     expected = torch.log_softmax(disabled, dim=-1)
-    finite = torch.isfinite(expected)
-    mismatch = (enabled['global_logits'][finite] - expected[finite]).abs().max()
-    if mismatch.item() > 1e-7 or not torch.equal(
-            torch.isneginf(enabled['global_logits']), torch.isneginf(expected)):
-        raise RuntimeError('Zero-initialized E16 is not E0')
+    mismatch, tolerance = probability_mismatch(
+        enabled['global_logits'], disabled
+    )
+    invalid_equal = torch.equal(
+        torch.isneginf(enabled['global_logits']), torch.isneginf(expected)
+    )
+    action_mismatch = (
+        enabled['factorized_greedy_actions'] != disabled.argmax(-1)
+    ).sum().item()
+    if mismatch > tolerance or not invalid_equal or action_mismatch:
+        raise RuntimeError(
+            'Zero-initialized E16 differs from E0: probability_mismatch=%g, '
+            'tolerance=%g, invalid_masks_equal=%s, action_mismatch=%d' % (
+                mismatch, tolerance, invalid_equal, action_mismatch
+            )
+        )
     if enabled['budget_activation_rate'].item() != 0:
         raise RuntimeError('Zero-initialized E16 activated its graph budget')
 
@@ -99,7 +118,8 @@ def exercise_model(model):
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     if trainable != 590848:
         raise RuntimeError('E16 expected exactly 590,848 trainable parameters')
-    return trainable, mismatch.item(), stop_mismatch.item(), outputs
+    return (trainable, mismatch, tolerance, action_mismatch,
+            stop_mismatch.item(), outputs)
 
 
 def main():
@@ -133,12 +153,14 @@ def main():
     model.factorized_landmark.reset_output()
     del checkpoint, weights
 
-    trainable, mismatch, stop_mismatch, outputs = exercise_model(model)
+    (trainable, mismatch, tolerance, action_mismatch,
+     stop_mismatch, outputs) = exercise_model(model)
     print('E16_MODEL_SMOKE_PASSED trainable=%d '
-          'max_distribution_mismatch=%g stop_probability_mismatch=%g '
+          'max_probability_mismatch=%g tolerance=%g action_mismatch=%d '
+          'stop_probability_mismatch=%g '
           'budget_activation_rate=%g projected_cost=%g base_cost=%g '
           'frozen_gradient=0' % (
-              trainable, mismatch, stop_mismatch,
+              trainable, mismatch, tolerance, action_mismatch, stop_mismatch,
               outputs['budget_activation_rate'].item(),
               outputs['projected_route_cost'].item(),
               outputs['base_route_cost'].item(),
