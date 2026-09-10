@@ -117,9 +117,13 @@ class RLTrainer(BaseVLNCETrainer):
         self.factorized_landmark_only = getattr(
             config.GRPO, 'factorized_landmark_only', False
         )
+        self.budgeted_factorized_landmark_only = getattr(
+            config.GRPO, 'budgeted_factorized_landmark_only', False
+        )
         self.e13_optimizer_updates = 0
         self.e14_optimizer_updates = 0
         self.e15_optimizer_updates = 0
+        self.e16_optimizer_updates = 0
         self.scaler = GradScaler(enabled=self.enable_amp)
         print("config.GRPO:\n", config.GRPO)
         print(f"GRPO params: grpo_epsilon {self.grpo_epsilon}, grpo_beta {self.grpo_beta}, max_grad_norm {self.max_grad_norm}, grpo_update_epochs {self.grpo_update_epochs} \
@@ -137,6 +141,9 @@ class RLTrainer(BaseVLNCETrainer):
         if (self.factorized_landmark_only and
                 iteration != self.config.GRPO.iters):
             return
+        if (self.budgeted_factorized_landmark_only and
+                iteration != self.config.GRPO.iters):
+            return
         if self.successor_only:
             experiment_metadata = {
                 'e12_initial_decoder_sha256': self.successor_initial_digest
@@ -148,6 +155,10 @@ class RLTrainer(BaseVLNCETrainer):
         elif self.landmark_transport_only:
             experiment_metadata = {
                 'e14_optimizer_updates': self.e14_optimizer_updates
+            }
+        elif self.budgeted_factorized_landmark_only:
+            experiment_metadata = {
+                'e16_optimizer_updates': self.e16_optimizer_updates
             }
         elif self.factorized_landmark_only:
             experiment_metadata = {
@@ -382,6 +393,9 @@ class RLTrainer(BaseVLNCETrainer):
             instruction_coverage_only = self.instruction_coverage_only
             landmark_transport_only = self.landmark_transport_only
             factorized_landmark_only = self.factorized_landmark_only
+            budgeted_factorized_landmark_only = (
+                self.budgeted_factorized_landmark_only
+            )
             if success_set_commit and not terminal_commit_only:
                 raise ValueError(
                     'success_set_commit requires terminal_commit_only'
@@ -393,7 +407,8 @@ class RLTrainer(BaseVLNCETrainer):
                         terminal_commit_only, success_set_commit,
                         frontier_advantage, geo_token_only,
                         instruction_coverage_only, landmark_transport_only,
-                        factorized_landmark_only]):
+                        factorized_landmark_only,
+                        budgeted_factorized_landmark_only]):
                     raise ValueError(
                         'E9 cannot use E2-E8 training modes'
                     )
@@ -417,7 +432,8 @@ class RLTrainer(BaseVLNCETrainer):
                         terminal_commit_only, success_set_commit,
                         setwise_group_policy, geo_token_only,
                         instruction_coverage_only, landmark_transport_only,
-                        factorized_landmark_only]):
+                        factorized_landmark_only,
+                        budgeted_factorized_landmark_only]):
                     raise ValueError('E10 cannot use E2-E9 training modes')
                 if (self.config.GRPO.sample_num != 8 or
                         self.config.MODEL.task_type != 'r2r' or
@@ -437,7 +453,8 @@ class RLTrainer(BaseVLNCETrainer):
                     anchor_repair_only, hindsight_stop_only,
                     terminal_commit_only, geo_token_only,
                     instruction_coverage_only, landmark_transport_only,
-                    factorized_landmark_only]) > 1:
+                    factorized_landmark_only,
+                    budgeted_factorized_landmark_only]) > 1:
                 raise ValueError(
                     'GRPO lightweight-only modes are mutually exclusive'
                 )
@@ -447,7 +464,8 @@ class RLTrainer(BaseVLNCETrainer):
                          terminal_commit_only, success_set_commit,
                          setwise_group_policy, frontier_advantage, geo_token_only,
                          instruction_coverage_only, landmark_transport_only,
-                         factorized_landmark_only]) or
+                         factorized_landmark_only,
+                         budgeted_factorized_landmark_only]) or
                         vln_bert_module.successor is None or
                         self.config.GPU_NUMBERS != 1 or self.enable_amp or
                         self.enable_all_dropouts or self.dropout_in_sampling or
@@ -456,7 +474,8 @@ class RLTrainer(BaseVLNCETrainer):
                         self.config.GRPO.is_requeue):
                     raise ValueError('E12 requires independent, single-GPU, dropout-free control training')
                 self.trainable_parts = [vln_bert_module.successor]
-            elif factorized_landmark_only:
+            elif (factorized_landmark_only or
+                    budgeted_factorized_landmark_only):
                 transport = vln_bert_module.factorized_landmark
                 if transport is None:
                     raise ValueError(
@@ -480,6 +499,8 @@ class RLTrainer(BaseVLNCETrainer):
                         self.config.MODEL.instruction_coverage_hidden_size != 0 or
                         self.config.MODEL.landmark_transport_size != 0 or
                         self.config.MODEL.factorized_landmark_size != 128 or
+                        bool(self.config.MODEL.factorized_landmark_budgeted) !=
+                        budgeted_factorized_landmark_only or
                         success_set_commit or setwise_group_policy or
                         frontier_advantage or self.config.GPU_NUMBERS != 1 or
                         self.enable_amp or self.enable_all_dropouts or
@@ -487,8 +508,11 @@ class RLTrainer(BaseVLNCETrainer):
                         self.config.GRPO.waypoint_aug or
                         self.config.GRPO.back_algo != 'control' or
                         self.config.GRPO.is_requeue):
+                    experiment = (
+                        'E16' if budgeted_factorized_landmark_only else 'E15'
+                    )
                     raise ValueError(
-                        'E15 requires strict E0, R2R, sample_num=8, a '
+                        experiment + ' requires strict E0, R2R, sample_num=8, a '
                         '128-wide factorized transport, and independent '
                         'single-GPU dropout-free control training'
                     )
@@ -728,15 +752,19 @@ class RLTrainer(BaseVLNCETrainer):
                     'parameters, got invalid=%s and %d parameters' %
                     (invalid_names, trainable_count)
                 )
-        if self.factorized_landmark_only:
+        if (self.factorized_landmark_only or
+                self.budgeted_factorized_landmark_only):
             trainable_count = sum(p.numel() for _, p in trainable_parameters)
             invalid_names = [
                 name for name, _ in trainable_parameters
                 if '.factorized_landmark.' not in name
             ]
             if invalid_names or trainable_count != 590848:
+                experiment = (
+                    'E16' if self.budgeted_factorized_landmark_only else 'E15'
+                )
                 raise RuntimeError(
-                    'E15 expected exactly 590,848 factorized-landmark '
+                    experiment + ' expected exactly 590,848 factorized-landmark '
                     'parameters, got invalid=%s and %d parameters' %
                     (invalid_names, trainable_count)
                 )
@@ -945,7 +973,8 @@ class RLTrainer(BaseVLNCETrainer):
                     )
                 vln_bert_module.landmark_transport.reset_output()
 
-            if self.factorized_landmark_only:
+            if (self.factorized_landmark_only or
+                    self.budgeted_factorized_landmark_only):
                 expected_missing = {
                     'net.vln_bert.factorized_landmark.' + name
                     for name in vln_bert_module.factorized_landmark.state_dict()
@@ -956,8 +985,11 @@ class RLTrainer(BaseVLNCETrainer):
                 }
                 if (actual_missing != expected_missing or
                         incompatible_keys.unexpected_keys):
+                    experiment = (
+                        'E16' if self.budgeted_factorized_landmark_only else 'E15'
+                    )
                     raise RuntimeError(
-                        'E15 must start from a complete E0 with no factorized '
+                        experiment + ' must start from a complete E0 with no factorized '
                         'landmark weights'
                     )
                 vln_bert_module.factorized_landmark.reset_output()
@@ -1598,7 +1630,8 @@ class RLTrainer(BaseVLNCETrainer):
             )
 
         if (self.landmark_transport_only or
-                self.factorized_landmark_only):
+                self.factorized_landmark_only or
+                self.budgeted_factorized_landmark_only):
             transport_count = sum(
                 sample['transport_count'] for sample in self.data_buffer
             )
@@ -1608,7 +1641,8 @@ class RLTrainer(BaseVLNCETrainer):
             self.logs['transport_residual_norm'].append(sum(
                 sample['transport_residual_sum'] for sample in self.data_buffer
             ) / max(transport_count, 1))
-            if self.factorized_landmark_only:
+            if (self.factorized_landmark_only or
+                    self.budgeted_factorized_landmark_only):
                 self.logs['conditional_frontier_kl'].append(sum(
                     sample['conditional_frontier_kl_sum']
                     for sample in self.data_buffer
@@ -1621,6 +1655,16 @@ class RLTrainer(BaseVLNCETrainer):
                     sample['stop_agreement_sum']
                     for sample in self.data_buffer
                 ) / max(transport_count, 1))
+            if self.budgeted_factorized_landmark_only:
+                for log_name, sample_name in [
+                        ('budget_activation_rate', 'budget_activation_sum'),
+                        ('budget_dual_lambda', 'budget_dual_lambda_sum'),
+                        ('base_route_cost', 'base_route_cost_sum'),
+                        ('routed_route_cost', 'routed_route_cost_sum'),
+                        ('projected_route_cost', 'projected_route_cost_sum')]:
+                    self.logs[log_name].append(sum(
+                        sample[sample_name] for sample in self.data_buffer
+                    ) / max(transport_count, 1))
 
         if self.instruction_coverage_only:
             coverage_sum = sum(
@@ -1915,6 +1959,8 @@ class RLTrainer(BaseVLNCETrainer):
                 )
             if self.factorized_landmark_only:
                 self.e15_optimizer_updates += 1
+            if self.budgeted_factorized_landmark_only:
+                self.e16_optimizer_updates += 1
             self.logs['policy_loss'].append(total_policy_loss_across_epochs / actual_epochs_processed)
             if self.need_ref_policy:
                 self.logs['kl_loss'].append(total_kl_loss_across_epochs / actual_epochs_processed)
@@ -2350,6 +2396,11 @@ class RLTrainer(BaseVLNCETrainer):
             "conditional_frontier_kl_sum": 0.0,
             "frontier_intervention_sum": 0.0,
             "stop_agreement_sum": 0.0,
+            "budget_activation_sum": 0.0,
+            "budget_dual_lambda_sum": 0.0,
+            "base_route_cost_sum": 0.0,
+            "routed_route_cost_sum": 0.0,
+            "projected_route_cost_sum": 0.0,
             "success": [None] * self.envs.num_envs,
             "oracle_success": [None] * self.envs.num_envs,
             "setwise_outcome": [None] * self.envs.num_envs,
@@ -2560,7 +2611,8 @@ class RLTrainer(BaseVLNCETrainer):
             nav_inputs_copy_for_cpu = self.copy_nav_inputs_dict(nav_inputs)
             nav_outs = self.policy.net(**nav_inputs_for_gpu)
             if (self.landmark_transport_only or
-                    self.factorized_landmark_only):
+                    self.factorized_landmark_only or
+                    self.budgeted_factorized_landmark_only):
                 data_this_sample['transport_entropy_sum'] += (
                     nav_outs['transport_entropy'].item()
                 )
@@ -2568,7 +2620,8 @@ class RLTrainer(BaseVLNCETrainer):
                     nav_outs['transport_residual_norm'].item()
                 )
                 data_this_sample['transport_count'] += 1
-            if self.factorized_landmark_only:
+            if (self.factorized_landmark_only or
+                    self.budgeted_factorized_landmark_only):
                 data_this_sample['conditional_frontier_kl_sum'] += (
                     nav_outs['conditional_frontier_kl'].item()
                 )
@@ -2582,6 +2635,16 @@ class RLTrainer(BaseVLNCETrainer):
                 data_this_sample['stop_agreement_sum'] += (
                     (base_stop == routed_stop).float().mean().item()
                 )
+            if self.budgeted_factorized_landmark_only:
+                for sample_name, output_name in [
+                        ('budget_activation_sum', 'budget_activation_rate'),
+                        ('budget_dual_lambda_sum', 'budget_dual_lambda'),
+                        ('base_route_cost_sum', 'base_route_cost'),
+                        ('routed_route_cost_sum', 'routed_route_cost'),
+                        ('projected_route_cost_sum', 'projected_route_cost')]:
+                    data_this_sample[sample_name] += nav_outs[
+                        output_name
+                    ].item()
             if self.instruction_coverage_only:
                 frontier_masks = (
                     nav_inputs['gmap_masks'] &
@@ -2625,7 +2688,8 @@ class RLTrainer(BaseVLNCETrainer):
                 )
 
             # determine action
-            if self.factorized_landmark_only:
+            if (self.factorized_landmark_only or
+                    self.budgeted_factorized_landmark_only):
                 c = torch.distributions.Categorical(nav_probs)
                 a_t = c.sample().detach()
             elif hindsight_stop_only or terminal_commit_only or use_base_policy:

@@ -110,6 +110,7 @@ GRPO:
   instruction_coverage_only: False
   landmark_transport_only: False
   factorized_landmark_only: False
+  budgeted_factorized_landmark_only: False
   frontier_advantage_start: 1.0
   frontier_advantage_end: 0.25
   frontier_progress_clip: 3.0
@@ -139,6 +140,7 @@ MODEL:
   instruction_coverage_hidden_size: 0
   landmark_transport_size: 0
   factorized_landmark_size: 0
+  factorized_landmark_budgeted: False
   merge_ghost: True
   consume_ghost: True
   

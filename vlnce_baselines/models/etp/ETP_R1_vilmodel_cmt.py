@@ -1332,6 +1332,13 @@ class GlocalTextPathNavCMT(BertPreTrainedModel):
 
         self.factorized_landmark = None
         factorized_size = getattr(config, 'factorized_landmark_size', 0)
+        self.factorized_landmark_budgeted = getattr(
+            config, 'factorized_landmark_budgeted', False
+        )
+        if self.factorized_landmark_budgeted and not factorized_size:
+            raise ValueError(
+                'budgeted routing requires factorized landmark routing'
+            )
         if factorized_size:
             if (any([self.candidate_scorer, self.gaussian_bev,
                      self.anchor_repair, self.hindsight_stop,
@@ -1569,20 +1576,34 @@ class GlocalTextPathNavCMT(BertPreTrainedModel):
             routed_logits.masked_fill_(
                 frontier_masks.logical_not(), -float('inf')
             )
+            decision_logits = routed_logits
+            budget_diagnostics = None
+            if self.factorized_landmark_budgeted:
+                from vlnce_baselines.budgeted_factorized_landmark import (
+                    current_frontier_costs,
+                    project_frontier_logits,
+                )
+                frontier_costs = current_frontier_costs(
+                    gmap_step_ids, gmap_pair_dists, gmap_visited_masks
+                )
+                decision_logits, budget_diagnostics = project_frontier_logits(
+                    base_global_logits, routed_logits, frontier_masks,
+                    frontier_costs,
+                )
             global_logits = factorized_action_log_probs(
-                base_global_logits, routed_logits, frontier_masks
+                base_global_logits, decision_logits, frontier_masks
             )
             factorized_greedy_actions = select_greedy_actions(
-                base_global_logits, routed_logits, frontier_masks
+                base_global_logits, decision_logits, frontier_masks
             )
             active = frontier_masks.any(dim=-1)
             base_frontier_actions = base_global_logits.masked_fill(
                 frontier_masks.logical_not(), -float('inf')
             ).argmax(dim=-1)
-            routed_frontier_actions = routed_logits.argmax(dim=-1)
+            routed_frontier_actions = decision_logits.argmax(dim=-1)
             factorized_diagnostics = {
                 'conditional_kl': conditional_frontier_kl(
-                    base_global_logits, routed_logits, frontier_masks
+                    base_global_logits, decision_logits, frontier_masks
                 ).detach(),
                 'frontier_intervention': (
                     (base_frontier_actions != routed_frontier_actions)[active]
@@ -1595,6 +1616,8 @@ class GlocalTextPathNavCMT(BertPreTrainedModel):
                     if frontier_masks.any() else global_logits.new_zeros(())
                 ),
             }
+            if budget_diagnostics is not None:
+                factorized_diagnostics['budget'] = budget_diagnostics
         coverage = None
         marginal = None
         coverage_residual = None
@@ -1681,4 +1704,11 @@ class GlocalTextPathNavCMT(BertPreTrainedModel):
             outs['transport_residual_norm'] = factorized_diagnostics[
                 'residual_norm'
             ]
+            if 'budget' in factorized_diagnostics:
+                budget = factorized_diagnostics['budget']
+                outs['budget_activation_rate'] = budget['activation_rate']
+                outs['budget_dual_lambda'] = budget['dual_lambda']
+                outs['base_route_cost'] = budget['base_cost']
+                outs['routed_route_cost'] = budget['routed_cost']
+                outs['projected_route_cost'] = budget['projected_cost']
         return outs

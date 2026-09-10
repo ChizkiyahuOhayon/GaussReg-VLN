@@ -67,6 +67,7 @@ _C.GRPO.successor_only = False
 _C.GRPO.instruction_coverage_only = False
 _C.GRPO.landmark_transport_only = False
 _C.GRPO.factorized_landmark_only = False
+_C.GRPO.budgeted_factorized_landmark_only = False
 # -----------------------------------------------------------------------------
 # IMITATION LEARNING CONFIG
 # -----------------------------------------------------------------------------
@@ -157,6 +158,7 @@ _C.MODEL.successor_hidden_size = 0
 _C.MODEL.instruction_coverage_hidden_size = 0
 _C.MODEL.landmark_transport_size = 0
 _C.MODEL.factorized_landmark_size = 0
+_C.MODEL.factorized_landmark_budgeted = False
 
 _C.MODEL.INSTRUCTION_ENCODER = CN()
 _C.MODEL.INSTRUCTION_ENCODER.sensor_uuid = "instruction"
