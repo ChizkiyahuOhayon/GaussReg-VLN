@@ -1335,9 +1335,21 @@ class GlocalTextPathNavCMT(BertPreTrainedModel):
         self.factorized_landmark_budgeted = getattr(
             config, 'factorized_landmark_budgeted', False
         )
+        self.factorized_landmark_monotonic = getattr(
+            config, 'factorized_landmark_monotonic', False
+        )
         if self.factorized_landmark_budgeted and not factorized_size:
             raise ValueError(
                 'budgeted routing requires factorized landmark routing'
+            )
+        if self.factorized_landmark_monotonic and not factorized_size:
+            raise ValueError(
+                'monotonic routing requires factorized landmark routing'
+            )
+        if (self.factorized_landmark_budgeted and
+                self.factorized_landmark_monotonic):
+            raise ValueError(
+                'budgeted and monotonic factorized routing are exclusive'
             )
         if factorized_size:
             if (any([self.candidate_scorer, self.gaussian_bev,
@@ -1349,10 +1361,18 @@ class GlocalTextPathNavCMT(BertPreTrainedModel):
                 raise ValueError(
                     'factorized landmark routing requires E2-E14 modules off'
                 )
-            from vlnce_baselines.landmark_transport import LandmarkTransport
-            self.factorized_landmark = LandmarkTransport(
-                config.hidden_size, factorized_size
-            )
+            if self.factorized_landmark_monotonic:
+                from vlnce_baselines.monotonic_factorized_landmark import (
+                    MonotonicLandmarkTransport,
+                )
+                self.factorized_landmark = MonotonicLandmarkTransport(
+                    config.hidden_size, factorized_size
+                )
+            else:
+                from vlnce_baselines.landmark_transport import LandmarkTransport
+                self.factorized_landmark = LandmarkTransport(
+                    config.hidden_size, factorized_size
+                )
 
         self.init_weights()
         if self.global_encoder.gmap_gauss_embedding is not None:
@@ -1548,13 +1568,16 @@ class GlocalTextPathNavCMT(BertPreTrainedModel):
                 factorized_greedy_actions as select_greedy_actions,
                 frontier_action_mask,
             )
+            transport_args = (
+                gmap_transport_views,
+                gmap_transport_masks,
+                transport_txt_embeds,
+                txt_masks,
+            )
+            if self.factorized_landmark_monotonic:
+                transport_args += (gmap_step_ids, gmap_visited_masks)
             transport_residual, transport_diagnostics = (
-                self.factorized_landmark(
-                    gmap_transport_views,
-                    gmap_transport_masks,
-                    transport_txt_embeds,
-                    txt_masks,
-                )
+                self.factorized_landmark(*transport_args)
             )
             frontier_masks = frontier_action_mask(
                 gmap_masks, gmap_visited_masks
@@ -1618,6 +1641,15 @@ class GlocalTextPathNavCMT(BertPreTrainedModel):
             }
             if budget_diagnostics is not None:
                 factorized_diagnostics['budget'] = budget_diagnostics
+            if 'stage_progress' in transport_diagnostics:
+                factorized_diagnostics['stage'] = {
+                    'progress': transport_diagnostics['stage_progress'],
+                    'expected': transport_diagnostics['stage_expected'],
+                    'entropy': transport_diagnostics['stage_entropy'],
+                    'advance_mass': transport_diagnostics[
+                        'stage_advance_mass'
+                    ],
+                }
         coverage = None
         marginal = None
         coverage_residual = None
@@ -1711,4 +1743,12 @@ class GlocalTextPathNavCMT(BertPreTrainedModel):
                 outs['base_route_cost'] = budget['base_cost']
                 outs['routed_route_cost'] = budget['routed_cost']
                 outs['projected_route_cost'] = budget['projected_cost']
+            if 'stage' in factorized_diagnostics:
+                stage = factorized_diagnostics['stage']
+                outs['instruction_stage_progress'] = stage['progress']
+                outs['instruction_stage_expected'] = stage['expected']
+                outs['instruction_stage_entropy'] = stage['entropy']
+                outs['instruction_stage_advance_mass'] = stage[
+                    'advance_mass'
+                ]
         return outs

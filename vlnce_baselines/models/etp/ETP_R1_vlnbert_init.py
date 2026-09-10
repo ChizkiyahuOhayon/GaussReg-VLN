@@ -78,6 +78,9 @@ def get_vlnbert_models(config=None, dropout_rate=0.1):
     vis_config.factorized_landmark_budgeted = getattr(
         config, 'factorized_landmark_budgeted', False
     )
+    vis_config.factorized_landmark_monotonic = getattr(
+        config, 'factorized_landmark_monotonic', False
+    )
 
     vis_config.num_l_layers = 12
     vis_config.num_pano_layers = 2

@@ -111,6 +111,7 @@ GRPO:
   landmark_transport_only: False
   factorized_landmark_only: False
   budgeted_factorized_landmark_only: False
+  monotonic_factorized_landmark_only: False
   frontier_advantage_start: 1.0
   frontier_advantage_end: 0.25
   frontier_progress_clip: 3.0
@@ -141,6 +142,7 @@ MODEL:
   landmark_transport_size: 0
   factorized_landmark_size: 0
   factorized_landmark_budgeted: False
+  factorized_landmark_monotonic: False
   merge_ghost: True
   consume_ghost: True
   
