@@ -1982,7 +1982,12 @@ class RLTrainer(BaseVLNCETrainer):
 
                 trainable_params = [p for p in self.policy.parameters() if p.requires_grad]
                 if trainable_params:
-                    grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, self.max_grad_norm)
+                    grad_norm = torch.nn.utils.clip_grad_norm_(
+                        trainable_params, self.max_grad_norm,
+                        error_if_nonfinite=(
+                            self.monotonic_factorized_landmark_only
+                        ),
+                    )
                     self.logs['grad_norm'].append(grad_norm.item())
                 
                 self.scaler.step(self.optimizer)

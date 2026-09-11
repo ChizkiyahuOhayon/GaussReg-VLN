@@ -25,3 +25,8 @@ def test_e17_records_stage_diagnostics_in_sampling_and_logging():
             'instruction_stage_expected', 'instruction_stage_entropy',
             'instruction_stage_advance_mass'):
         assert SOURCE.count(name) >= 2
+
+
+def test_e17_rejects_nonfinite_gradient_before_optimizer_step():
+    assert 'error_if_nonfinite=(' in SOURCE
+    assert 'self.monotonic_factorized_landmark_only' in SOURCE

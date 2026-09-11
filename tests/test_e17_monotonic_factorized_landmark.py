@@ -95,6 +95,56 @@ def test_alignment_is_differentiable_and_rejects_nonfinite_evidence():
         )
 
 
+@pytest.mark.parametrize('history_length', [1, 2, 3])
+def test_unreachable_future_slots_have_finite_backward(history_length):
+    emissions = torch.randn(
+        1, history_length, 4, requires_grad=True
+    )
+    progress = MFLR.monotonic_progress(
+        emissions,
+        torch.ones(1, history_length, dtype=torch.bool),
+        torch.ones(1, 4, dtype=torch.bool),
+    )
+
+    (progress * torch.arange(4, dtype=progress.dtype)).sum().backward()
+
+    assert torch.isfinite(progress).all()
+    assert torch.isfinite(emissions.grad).all()
+
+
+def test_short_history_optimization_keeps_e17_parameters_finite():
+    torch.manual_seed(17)
+    module = MFLR.MonotonicLandmarkTransport(16, 8)
+    module.output.weight.data.normal_(std=0.05)
+    optimizer = torch.optim.SGD(module.parameters(), lr=0.1)
+    inputs = (
+        torch.randn(1, 5, 3, 16),
+        torch.tensor([[
+            [False] * 3, [True] * 3, [True] * 3,
+            [True, False, False], [True, False, False],
+        ]]),
+        torch.randn(1, 8, 16),
+        torch.ones(1, 8, dtype=torch.bool),
+        torch.tensor([[0, 1, 2, 0, 0]]),
+        torch.tensor([[False, True, True, False, False]]),
+    )
+
+    for _ in range(3):
+        optimizer.zero_grad()
+        residual, _ = module(*inputs)
+        residual.square().mean().backward()
+        assert all(
+            parameter.grad is not None and
+            torch.isfinite(parameter.grad).all()
+            for parameter in module.parameters()
+        )
+        optimizer.step()
+        assert all(
+            torch.isfinite(parameter).all()
+            for parameter in module.parameters()
+        )
+
+
 def test_graph_history_is_sorted_and_frontiers_are_excluded():
     emissions = torch.tensor([[
         [0.0], [20.0], [10.0], [999.0],

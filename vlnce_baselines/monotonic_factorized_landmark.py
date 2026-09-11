@@ -41,18 +41,22 @@ def monotonic_progress(emissions, history_masks, slot_masks):
         ).index_select(1, slot_indices)
         if not torch.isfinite(values).all():
             raise ValueError('Valid monotonic emissions must be finite')
-        alpha = values.new_full((values.size(1),), -float('inf'))
-        alpha[0] = values[0, 0]
+        alpha = values[0, :1]
         for observation in values[1:]:
-            advance = torch.cat([
-                alpha.new_full((1,), -float('inf')), alpha[:-1]
-            ])
-            alpha = observation + torch.logsumexp(
-                torch.stack([alpha, advance]), dim=0
-            )
+            reachable = min(alpha.numel() + 1, values.size(1))
+            updated = [observation[0] + alpha[0]]
+            for slot in range(1, reachable):
+                if slot == alpha.numel():
+                    previous = alpha[slot - 1]
+                else:
+                    previous = torch.logaddexp(
+                        alpha[slot], alpha[slot - 1]
+                    )
+                updated.append(observation[slot] + previous)
+            alpha = torch.stack(updated)
         probabilities = emissions.new_zeros(emissions.size(2))
         probabilities = probabilities.scatter(
-            0, slot_indices, torch.softmax(alpha, dim=0)
+            0, slot_indices[:alpha.numel()], torch.softmax(alpha, dim=0)
         )
         rows.append(probabilities)
     return torch.stack(rows)

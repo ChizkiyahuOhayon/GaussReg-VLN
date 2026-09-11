@@ -21,7 +21,9 @@ def ordered_slot_content(text_embeds, text_masks, num_slots=NUM_LANDMARK_SLOTS):
     positions = torch.arange(
         text_masks.size(1), device=text_masks.device
     ).unsqueeze(0)
-    slot_ids = positions * num_slots // lengths.unsqueeze(1)
+    slot_ids = torch.div(
+        positions * num_slots, lengths.unsqueeze(1), rounding_mode='floor'
+    )
     slot_ids = slot_ids.clamp_max(num_slots - 1)
     assignments = F.one_hot(slot_ids, num_slots).bool()
     assignments = assignments & text_masks.unsqueeze(-1)
