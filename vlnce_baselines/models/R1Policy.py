@@ -174,7 +174,7 @@ class ETP(Net):
                 view_embeds=None, view_masks=None,
                 gmap_instruction_evidence=None,
                 gmap_transport_views=None, gmap_transport_masks=None,
-                successor_override=None):
+                successor_override=None, gmap_route_masks=None):
 
         if mode == 'language':
             encoded_sentence = self.vln_bert.forward_txt(
@@ -413,7 +413,7 @@ class ETP(Net):
                 gmap_geo_tokens, gmap_geo_masks,
                 gmap_instruction_evidence,
                 gmap_transport_views, gmap_transport_masks,
-                successor_override,
+                successor_override, gmap_route_masks,
             )
             return outs
 

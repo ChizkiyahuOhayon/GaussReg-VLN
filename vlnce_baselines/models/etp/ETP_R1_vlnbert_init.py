@@ -72,6 +72,10 @@ def get_vlnbert_models(config=None, dropout_rate=0.1):
     vis_config.landmark_transport_size = getattr(
         config, 'landmark_transport_size', 0
     )
+    vis_config.route_attention = getattr(config, 'route_attention', False)
+    vis_config.route_attention_full_graph = getattr(
+        config, 'route_attention_full_graph', False
+    )
     vis_config.factorized_landmark_size = getattr(
         config, 'factorized_landmark_size', 0
     )
@@ -174,4 +178,6 @@ def get_vlnbert_models(config=None, dropout_rate=0.1):
             not has_factorized_landmark):
         # from_pretrained reinitializes missing keys after model.__init__.
         visual_model.factorized_landmark.reset_output()
+    if visual_model.route_attention is not None:
+        visual_model.route_attention.copy_from_e0(visual_model)
     return visual_model

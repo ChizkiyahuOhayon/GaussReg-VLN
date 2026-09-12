@@ -1374,6 +1374,20 @@ class GlocalTextPathNavCMT(BertPreTrainedModel):
                     config.hidden_size, factorized_size
                 )
 
+        self.route_attention = None
+        if getattr(config, 'route_attention', False):
+            if (any([self.candidate_scorer, self.gaussian_bev,
+                     self.anchor_repair, self.hindsight_stop,
+                     self.terminal_commit, self.geo_token,
+                     self.instruction_coverage, self.successor,
+                     self.landmark_transport, self.factorized_landmark]) or
+                    getattr(config, 'gauss_feat_size', 0)):
+                raise ValueError('E18 requires E2-E17 modules off')
+            from vlnce_baselines.route_attention import ExecutableRouteAttention
+            self.route_attention = ExecutableRouteAttention(
+                self, getattr(config, 'route_attention_full_graph', False)
+            )
+
         self.init_weights()
         if self.global_encoder.gmap_gauss_embedding is not None:
             nn.init.zeros_(self.global_encoder.gmap_gauss_embedding.weight)
@@ -1477,7 +1491,7 @@ class GlocalTextPathNavCMT(BertPreTrainedModel):
         gmap_geo_tokens=None, gmap_geo_masks=None,
         gmap_instruction_evidence=None,
         gmap_transport_views=None, gmap_transport_masks=None,
-        successor_override=None,
+        successor_override=None, gmap_route_masks=None,
     ):
         # global branch
         batch_size = gmap_task_embeddings.size(0)
@@ -1523,10 +1537,31 @@ class GlocalTextPathNavCMT(BertPreTrainedModel):
         else:
             graph_sprels = None
 
-        txt_embeds, gmap_embeds = self.global_encoder.encoder(
-            txt_embeds, txt_masks, gmap_embeds, encoder_masks,
-            graph_sprels=graph_sprels
-        )
+        route_logits = None
+        if self.route_attention is not None:
+            extended_text = extend_neg_masks(txt_masks)
+            extended_graph = extend_neg_masks(encoder_masks)
+            with torch.no_grad():
+                layers = self.global_encoder.encoder.x_layers
+                for layer in layers[:-1]:
+                    txt_embeds, gmap_embeds = layer(
+                        txt_embeds, extended_text, gmap_embeds, extended_graph,
+                        graph_sprels=graph_sprels,
+                    )
+            route_logits = self.route_attention(
+                txt_embeds, txt_masks, gmap_embeds, encoder_masks,
+                gmap_route_masks, graph_sprels,
+            )
+            with torch.no_grad():
+                txt_embeds, gmap_embeds = layers[-1](
+                    txt_embeds, extended_text, gmap_embeds, extended_graph,
+                    graph_sprels=graph_sprels,
+                )
+        else:
+            txt_embeds, gmap_embeds = self.global_encoder.encoder(
+                txt_embeds, txt_masks, gmap_embeds, encoder_masks,
+                graph_sprels=graph_sprels
+            )
         gmap_embeds = gmap_embeds[:, :action_slots]
         
         extended_txt_masks = extend_neg_masks(txt_masks)
@@ -1557,6 +1592,18 @@ class GlocalTextPathNavCMT(BertPreTrainedModel):
         base_global_logits = global_logits
         factorized_diagnostics = None
         factorized_greedy_actions = None
+        if route_logits is not None:
+            from vlnce_baselines.factorized_landmark import (
+                frontier_action_mask, factorized_action_log_probs,
+                factorized_greedy_actions as choose_frontier,
+            )
+            frontier_masks = frontier_action_mask(gmap_masks, gmap_visited_masks)
+            global_logits = factorized_action_log_probs(
+                base_global_logits, route_logits, frontier_masks
+            )
+            factorized_greedy_actions = choose_frontier(
+                base_global_logits, route_logits, frontier_masks
+            )
         if self.factorized_landmark is not None:
             if gmap_transport_views is None or gmap_transport_masks is None:
                 raise ValueError(
@@ -1703,6 +1750,9 @@ class GlocalTextPathNavCMT(BertPreTrainedModel):
             'gmap_embeds': gmap_embeds, 
             'global_logits': global_logits
         }
+        if route_logits is not None:
+            outs['base_global_logits'] = base_global_logits
+            outs['factorized_greedy_actions'] = factorized_greedy_actions
         if successor_features is not None:
             outs['successor_features'] = successor_features
         if (self.anchor_repair is not None or

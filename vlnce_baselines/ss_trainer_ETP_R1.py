@@ -295,8 +295,17 @@ class RLTrainer(BaseVLNCETrainer):
                 getattr(config.MODEL, 'successor_hidden_size', 0) or
                 getattr(config.MODEL, 'instruction_coverage_hidden_size', 0) or
                 getattr(config.MODEL, 'landmark_transport_size', 0) or
-                getattr(config.MODEL, 'factorized_landmark_size', 0)
+                getattr(config.MODEL, 'factorized_landmark_size', 0) or
+                getattr(config.MODEL, 'route_attention', False)
             )
+            if getattr(config.MODEL, 'route_attention', False):
+                if (not getattr(ckpt_dict['config'].MODEL, 'route_attention', False) or
+                        ckpt_dict['config'].MODEL.route_attention_full_graph !=
+                        config.MODEL.route_attention_full_graph):
+                    raise RuntimeError('E18 evaluation arm differs from checkpoint')
+                os.makedirs(config.RESULTS_DIR, exist_ok=True)
+                with open(os.path.join(config.RESULTS_DIR, 'e18_eval_config.yaml'), 'w') as stream:
+                    stream.write(config.dump())
             if exact_experiment_checkpoint and (
                     incompatible_keys.missing_keys or incompatible_keys.unexpected_keys):
                 raise RuntimeError('Experiment evaluation requires an exact complete checkpoint: %s' %
@@ -546,6 +555,12 @@ class RLTrainer(BaseVLNCETrainer):
                     transport_masks[i, j, :views.size(0)] = True
             outputs['gmap_transport_views'] = transport_views.cuda()
             outputs['gmap_transport_masks'] = transport_masks.cuda()
+        if getattr(self.config.MODEL, 'route_attention', False):
+            from vlnce_baselines.route_attention import batch_executable_route_masks
+            outputs['gmap_route_masks'] = batch_executable_route_masks(
+                self.gmaps, cur_vp, batch_gmap_vp_ids, max_gmap_len,
+                outputs['gmap_masks'].device,
+            )
         return outputs
 
     def _history_variable(self, obs):

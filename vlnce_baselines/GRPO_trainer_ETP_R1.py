@@ -127,6 +127,8 @@ class RLTrainer(BaseVLNCETrainer):
         self.e14_optimizer_updates = 0
         self.e15_optimizer_updates = 0
         self.e16_optimizer_updates = 0
+        self.route_attention_only = getattr(config.GRPO, 'route_attention_only', False)
+        self.e18_optimizer_updates = 0
         self.e17_optimizer_updates = 0
         self.scaler = GradScaler(enabled=self.enable_amp)
         print("config.GRPO:\n", config.GRPO)
@@ -139,6 +141,8 @@ class RLTrainer(BaseVLNCETrainer):
                 self._make_results_dir()
 
     def save_checkpoint(self, iteration: int):
+        if self.route_attention_only and iteration != self.config.GRPO.iters:
+            return
         if (self.landmark_transport_only and
                 iteration != self.config.GRPO.iters):
             return
@@ -171,6 +175,8 @@ class RLTrainer(BaseVLNCETrainer):
             experiment_metadata = {
                 'e17_optimizer_updates': self.e17_optimizer_updates
             }
+        elif self.route_attention_only:
+            experiment_metadata = {'e18_optimizer_updates': self.e18_optimizer_updates}
         elif self.factorized_landmark_only:
             experiment_metadata = {
                 'e15_optimizer_updates': self.e15_optimizer_updates
@@ -484,7 +490,13 @@ class RLTrainer(BaseVLNCETrainer):
                 raise ValueError(
                     'GRPO lightweight-only modes are mutually exclusive'
                 )
-            if self.successor_only:
+            if self.route_attention_only:
+                from vlnce_baselines.route_attention import validate_training_config
+                validate_training_config(self.config)
+                if vln_bert_module.route_attention is None:
+                    raise ValueError('E18 requires MODEL.route_attention')
+                self.trainable_parts = [vln_bert_module.route_attention]
+            elif self.successor_only:
                 if (any([gauss_only, scorer_only, gaussian_bev_only,
                          anchor_repair_only, hindsight_stop_only,
                          terminal_commit_only, success_set_commit,
@@ -762,6 +774,9 @@ class RLTrainer(BaseVLNCETrainer):
 
         not_trainable_parameters = [p for p in self.policy.parameters() if not p.requires_grad]
         trainable_parameters = [(n, p) for n, p in self.policy.named_parameters() if p.requires_grad]
+        if self.route_attention_only and (not trainable_parameters or any(
+                '.route_attention.' not in name for name, _ in trainable_parameters)):
+            raise RuntimeError('E18 may only update the route-attention branch')
         if self.successor_only and (not trainable_parameters or any(
                 '.successor.' not in name for name, _ in trainable_parameters)):
             raise RuntimeError('E12 may only update the successor decoder')
@@ -965,6 +980,19 @@ class RLTrainer(BaseVLNCETrainer):
             else:
                 print("\nThere are no extra network layers in the weight file.")
             print("="*75 + "\n")
+
+            if self.route_attention_only:
+                expected_missing = {
+                    'net.vln_bert.route_attention.' + name
+                    for name in vln_bert_module.route_attention.state_dict()
+                }
+                actual_missing = {
+                    key.replace('net.module.', 'net.')
+                    for key in incompatible_keys.missing_keys
+                }
+                if actual_missing != expected_missing or incompatible_keys.unexpected_keys:
+                    raise RuntimeError('E18 must start from complete pristine E0')
+                vln_bert_module.route_attention.copy_from_e0(vln_bert_module)
 
             if self.successor_only:
                 expected_missing = {
@@ -1271,6 +1299,9 @@ class RLTrainer(BaseVLNCETrainer):
                 self.ref_policy.load_state_dict(new_state_dict)
             else:
                 self.ref_policy.load_state_dict(self.policy.state_dict())
+            if self.route_attention_only:
+                # Both arms use the same frozen E0 KL anchor.
+                self.ref_policy.net.vln_bert.route_attention = None
         else:
             logger.info("BETA == 0, Skip create ref_policy!")
 
@@ -1439,6 +1470,12 @@ class RLTrainer(BaseVLNCETrainer):
                     transport_masks[i, j, :views.size(0)] = True
             outputs['gmap_transport_views'] = transport_views.cuda()
             outputs['gmap_transport_masks'] = transport_masks.cuda()
+        if getattr(self.config.MODEL, 'route_attention', False):
+            from vlnce_baselines.route_attention import batch_executable_route_masks
+            outputs['gmap_route_masks'] = batch_executable_route_masks(
+                self.gmaps, cur_vp, batch_gmap_vp_ids, max_gmap_len,
+                outputs['gmap_masks'].device,
+            )
         return outputs
 
     def train(self):
@@ -1985,7 +2022,8 @@ class RLTrainer(BaseVLNCETrainer):
                     grad_norm = torch.nn.utils.clip_grad_norm_(
                         trainable_params, self.max_grad_norm,
                         error_if_nonfinite=(
-                            self.monotonic_factorized_landmark_only
+                            self.monotonic_factorized_landmark_only or
+                            self.route_attention_only
                         ),
                     )
                     self.logs['grad_norm'].append(grad_norm.item())
@@ -2008,7 +2046,11 @@ class RLTrainer(BaseVLNCETrainer):
                     f"{expected_samples} policy samples."
                 )
 
+        if self.route_attention_only and actual_epochs_processed != 1:
+            raise RuntimeError('E18 iteration did not perform exactly one optimizer update')
         if actual_epochs_processed > 0:
+            if self.route_attention_only:
+                self.e18_optimizer_updates += 1
             if self.instruction_coverage_only:
                 self.e13_optimizer_updates += 1
             if self.landmark_transport_only:
