@@ -170,7 +170,7 @@ def results(args):
         if not math.isfinite(aggregate[key]) or abs(report['metrics'][name] / scale - aggregate[key]) > 1e-8:
             raise ValueError('Aggregate/per-episode mismatch: ' + key)
     from habitat.config import Config
-    evaluation = Config(new_allowed=True)
+    evaluation = Config()
     evaluation.merge_from_file(str(directory / 'e18_eval_config.yaml'))
     if (evaluation.EVAL.EPISODE_COUNT != -1 or evaluation.EVAL.fast_eval or
             evaluation.EVAL.EPISODE_ID is not None or evaluation.EVAL.SPLIT != 'val_unseen' or
