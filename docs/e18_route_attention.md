@@ -89,7 +89,7 @@ source run_r2r/habitat_env.bash
 nvidia-smi --query-gpu=index,memory.used,utilization.gpu --format=csv,noheader,nounits
 nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory --format=csv,noheader
 df -h .
-E18_GPU=$(nvidia-smi --query-gpu=index,memory.used,utilization.gpu --format=csv,noheader,nounits | awk -F, '$2 < 1024 && $3 < 5 {gsub(/ /,"",$1); print $1; exit}')
+E18_GPU=$(nvidia-smi --query-gpu=index,memory.used,utilization.gpu --format=csv,noheader,nounits | awk -F, '!found && $2 < 1024 && $3 < 5 {gsub(/ /,"",$1); print $1; found=1}')
 test -n "${E18_GPU}" || { echo 'No idle GPU; retry after resources become free.'; exit 1; }
 mkdir -p data/logs/launch
 # The experiment name is fixed; an existing evidence directory makes the runner refuse to start.
