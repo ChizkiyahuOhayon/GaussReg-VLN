@@ -95,6 +95,7 @@ def validate_training_config(config):
         'geo_token_only', 'successor_only', 'instruction_coverage_only',
         'landmark_transport_only', 'factorized_landmark_only',
         'budgeted_factorized_landmark_only', 'monotonic_factorized_landmark_only',
+        'factorized_geometry_only',
     )
     if (any(getattr(grpo, key, None) != value for key, value in expected.items()) or
             any(getattr(grpo, key, False) for key in excluded) or

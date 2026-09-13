@@ -1374,6 +1374,23 @@ class GlocalTextPathNavCMT(BertPreTrainedModel):
                     config.hidden_size, factorized_size
                 )
 
+        self.transient_geometry = None
+        transient_geometry_size = getattr(
+            config, 'transient_geometry_size', 0
+        )
+        if transient_geometry_size:
+            if (not factorized_size or self.factorized_landmark_budgeted or
+                    self.factorized_landmark_monotonic):
+                raise ValueError(
+                    'transient geometry requires plain factorized landmarks'
+                )
+            from vlnce_baselines.transient_local_geometry import (
+                TransientLocalGeometry,
+            )
+            self.transient_geometry = TransientLocalGeometry(
+                config.hidden_size, transient_geometry_size
+            )
+
         self.route_attention = None
         if getattr(config, 'route_attention', False):
             if (any([self.candidate_scorer, self.gaussian_bev,
@@ -1409,6 +1426,8 @@ class GlocalTextPathNavCMT(BertPreTrainedModel):
             self.landmark_transport.reset_output()
         if self.factorized_landmark is not None:
             self.factorized_landmark.reset_output()
+        if self.transient_geometry is not None:
+            self.transient_geometry.reset_output()
         
         if config.fix_lang_embedding:
             print("FIX LANG EMBEDDING!!!!!!!!!!!!!!!!!!!!!!!!")
@@ -1492,6 +1511,7 @@ class GlocalTextPathNavCMT(BertPreTrainedModel):
         gmap_instruction_evidence=None,
         gmap_transport_views=None, gmap_transport_masks=None,
         successor_override=None, gmap_route_masks=None,
+        gmap_local_geometry=None, gmap_local_geometry_masks=None,
     ):
         # global branch
         batch_size = gmap_task_embeddings.size(0)
@@ -1632,6 +1652,21 @@ class GlocalTextPathNavCMT(BertPreTrainedModel):
             routed_gmap_embeds = gmap_embeds + transport_residual * (
                 frontier_masks.unsqueeze(-1).to(transport_residual.dtype)
             )
+            geometry_diagnostics = None
+            if self.transient_geometry is not None:
+                if (gmap_local_geometry is None or
+                        gmap_local_geometry_masks is None):
+                    raise ValueError(
+                        'transient geometry requires current candidate points'
+                    )
+                geometry_residual, geometry_diagnostics = (
+                    self.transient_geometry(
+                        gmap_local_geometry, gmap_local_geometry_masks
+                    )
+                )
+                routed_gmap_embeds = routed_gmap_embeds + geometry_residual * (
+                    frontier_masks.unsqueeze(-1).to(geometry_residual.dtype)
+                )
             routed_text, _ = self.graph_query_text(
                 routed_gmap_embeds,
                 txt_embeds,
@@ -1697,6 +1732,8 @@ class GlocalTextPathNavCMT(BertPreTrainedModel):
                         'stage_advance_mass'
                     ],
                 }
+            if geometry_diagnostics is not None:
+                factorized_diagnostics['geometry'] = geometry_diagnostics
         coverage = None
         marginal = None
         coverage_residual = None
@@ -1783,6 +1820,13 @@ class GlocalTextPathNavCMT(BertPreTrainedModel):
                 'frontier_intervention'
             ]
             outs['transport_entropy'] = factorized_diagnostics['entropy']
+            if 'geometry' in factorized_diagnostics:
+                outs['geometry_coverage'] = factorized_diagnostics[
+                    'geometry'
+                ]['coverage']
+                outs['geometry_residual_norm'] = factorized_diagnostics[
+                    'geometry'
+                ]['residual_norm']
             outs['transport_residual_norm'] = factorized_diagnostics[
                 'residual_norm'
             ]

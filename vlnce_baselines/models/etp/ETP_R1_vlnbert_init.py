@@ -85,6 +85,9 @@ def get_vlnbert_models(config=None, dropout_rate=0.1):
     vis_config.factorized_landmark_monotonic = getattr(
         config, 'factorized_landmark_monotonic', False
     )
+    vis_config.transient_geometry_size = getattr(
+        config, 'transient_geometry_size', 0
+    )
 
     vis_config.num_l_layers = 12
     vis_config.num_pano_layers = 2
@@ -178,6 +181,12 @@ def get_vlnbert_models(config=None, dropout_rate=0.1):
             not has_factorized_landmark):
         # from_pretrained reinitializes missing keys after model.__init__.
         visual_model.factorized_landmark.reset_output()
+    has_transient_geometry = any(
+        'transient_geometry.' in key for key in new_ckpt_weights
+    )
+    if (visual_model.transient_geometry is not None and
+            not has_transient_geometry):
+        visual_model.transient_geometry.reset_output()
     if visual_model.route_attention is not None:
         visual_model.route_attention.copy_from_e0(visual_model)
     return visual_model

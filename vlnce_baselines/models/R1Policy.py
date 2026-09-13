@@ -30,6 +30,7 @@ from vlnce_baselines.waypoint_pred.utils import nms
 from vlnce_baselines.models.utils import (
     angle_feature_with_ele, dir_angle_feature_with_ele, angle_feature_torch, length2mask)
 from vlnce_baselines.geo_token import gaussian_free_space_tokens
+from vlnce_baselines.transient_local_geometry import depth_to_local_point_sets
 import math
 
 @baseline_registry.register_policy
@@ -93,6 +94,9 @@ class ETP(Net):
         self.device = device
         self.geo_token_enabled = (
             getattr(model_config, 'geo_token_hidden_size', 0) > 0
+        )
+        self.transient_geometry_enabled = (
+            getattr(model_config, 'transient_geometry_size', 0) > 0
         )
 
         print('\nInitalizing the ETP model ...')
@@ -174,7 +178,8 @@ class ETP(Net):
                 view_embeds=None, view_masks=None,
                 gmap_instruction_evidence=None,
                 gmap_transport_views=None, gmap_transport_masks=None,
-                successor_override=None, gmap_route_masks=None):
+                successor_override=None, gmap_route_masks=None,
+                gmap_local_geometry=None, gmap_local_geometry_masks=None):
 
         if mode == 'language':
             encoded_sentence = self.vln_bert.forward_txt(
@@ -319,6 +324,8 @@ class ETP(Net):
             cand_distances = []
             cand_geo_tokens = []
             cand_geo_masks = []
+            cand_local_geometry = []
+            cand_local_geometry_masks = []
             for j in range(batch_size):
                 if in_train:
                     angle_idxes = torch.tensor(batch_sample_angle_idxes[j])
@@ -362,6 +369,15 @@ class ETP(Net):
                     )
                     cand_geo_tokens.append(geo_tokens)
                     cand_geo_masks.append(geo_masks)
+                if self.transient_geometry_enabled:
+                    image_indices = torch.as_tensor(
+                        img_idxes, device=depth_maps.device, dtype=torch.long
+                    )
+                    point_sets, point_masks = depth_to_local_point_sets(
+                        depth_maps[j, image_indices]
+                    )
+                    cand_local_geometry.append(point_sets)
+                    cand_local_geometry_masks.append(point_masks)
             
             # for pano
             pano_rgb = rgb_feats                            # B x 12 x 2048
@@ -388,6 +404,11 @@ class ETP(Net):
             if self.geo_token_enabled:
                 outputs['cand_geo_tokens'] = cand_geo_tokens
                 outputs['cand_geo_masks'] = cand_geo_masks
+            if self.transient_geometry_enabled:
+                outputs['cand_local_geometry'] = cand_local_geometry
+                outputs['cand_local_geometry_masks'] = (
+                    cand_local_geometry_masks
+                )
             
             return outputs
 
@@ -414,6 +435,7 @@ class ETP(Net):
                 gmap_instruction_evidence,
                 gmap_transport_views, gmap_transport_masks,
                 successor_override, gmap_route_masks,
+                gmap_local_geometry, gmap_local_geometry_masks,
             )
             return outs
 

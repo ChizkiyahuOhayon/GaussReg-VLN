@@ -58,6 +58,7 @@ from vlnce_baselines.frontier_advantage import (
     mix_advantages,
 )
 from vlnce_baselines.geo_token import align_candidate_tokens
+from vlnce_baselines.transient_local_geometry import align_candidate_point_sets
 from vlnce_baselines.instruction_coverage import (
     NUM_INSTRUCTION_SLOTS,
     aggregate_view_evidence,
@@ -123,6 +124,9 @@ class RLTrainer(BaseVLNCETrainer):
         self.monotonic_factorized_landmark_only = getattr(
             config.GRPO, 'monotonic_factorized_landmark_only', False
         )
+        self.factorized_geometry_only = getattr(
+            config.GRPO, 'factorized_geometry_only', False
+        )
         self.e13_optimizer_updates = 0
         self.e14_optimizer_updates = 0
         self.e15_optimizer_updates = 0
@@ -130,6 +134,7 @@ class RLTrainer(BaseVLNCETrainer):
         self.route_attention_only = getattr(config.GRPO, 'route_attention_only', False)
         self.e18_optimizer_updates = 0
         self.e17_optimizer_updates = 0
+        self.e19_optimizer_updates = 0
         self.scaler = GradScaler(enabled=self.enable_amp)
         print("config.GRPO:\n", config.GRPO)
         print(f"GRPO params: grpo_epsilon {self.grpo_epsilon}, grpo_beta {self.grpo_beta}, max_grad_norm {self.max_grad_norm}, grpo_update_epochs {self.grpo_update_epochs} \
@@ -155,6 +160,9 @@ class RLTrainer(BaseVLNCETrainer):
         if (self.monotonic_factorized_landmark_only and
                 iteration != self.config.GRPO.iters):
             return
+        if (self.factorized_geometry_only and
+                iteration != self.config.GRPO.iters):
+            return
         if self.successor_only:
             experiment_metadata = {
                 'e12_initial_decoder_sha256': self.successor_initial_digest
@@ -177,6 +185,10 @@ class RLTrainer(BaseVLNCETrainer):
             }
         elif self.route_attention_only:
             experiment_metadata = {'e18_optimizer_updates': self.e18_optimizer_updates}
+        elif self.factorized_geometry_only:
+            experiment_metadata = {
+                'e19_optimizer_updates': self.e19_optimizer_updates
+            }
         elif self.factorized_landmark_only:
             experiment_metadata = {
                 'e15_optimizer_updates': self.e15_optimizer_updates
@@ -416,6 +428,7 @@ class RLTrainer(BaseVLNCETrainer):
             monotonic_factorized_landmark_only = (
                 self.monotonic_factorized_landmark_only
             )
+            factorized_geometry_only = self.factorized_geometry_only
             if success_set_commit and not terminal_commit_only:
                 raise ValueError(
                     'success_set_commit requires terminal_commit_only'
@@ -429,7 +442,8 @@ class RLTrainer(BaseVLNCETrainer):
                         instruction_coverage_only, landmark_transport_only,
                         factorized_landmark_only,
                         budgeted_factorized_landmark_only,
-                        monotonic_factorized_landmark_only]):
+                        monotonic_factorized_landmark_only,
+                        factorized_geometry_only]):
                     raise ValueError(
                         'E9 cannot use E2-E8 training modes'
                     )
@@ -455,7 +469,8 @@ class RLTrainer(BaseVLNCETrainer):
                         instruction_coverage_only, landmark_transport_only,
                         factorized_landmark_only,
                         budgeted_factorized_landmark_only,
-                        monotonic_factorized_landmark_only]):
+                        monotonic_factorized_landmark_only,
+                        factorized_geometry_only]):
                     raise ValueError('E10 cannot use E2-E9 training modes')
                 if (self.config.GRPO.sample_num != 8 or
                         self.config.MODEL.task_type != 'r2r' or
@@ -470,13 +485,20 @@ class RLTrainer(BaseVLNCETrainer):
                     raise ValueError(
                         'E10 requires R2R, sample_num=8, and no E2-E8 module'
                     )
-            if sum([
+            if (sum([
                     gauss_only, scorer_only, gaussian_bev_only,
                     anchor_repair_only, hindsight_stop_only,
                     terminal_commit_only, geo_token_only,
                     instruction_coverage_only, landmark_transport_only,
                     factorized_landmark_only,
-                    budgeted_factorized_landmark_only]) > 1:
+                    budgeted_factorized_landmark_only]) > 1 or
+                    (factorized_geometry_only and any([
+                        gauss_only, scorer_only, gaussian_bev_only,
+                        anchor_repair_only, hindsight_stop_only,
+                        terminal_commit_only, geo_token_only,
+                        instruction_coverage_only, landmark_transport_only,
+                        factorized_landmark_only,
+                        budgeted_factorized_landmark_only]))):
                 raise ValueError(
                     'GRPO lightweight-only modes are mutually exclusive'
                 )
@@ -486,7 +508,8 @@ class RLTrainer(BaseVLNCETrainer):
                     terminal_commit_only, geo_token_only,
                     instruction_coverage_only, landmark_transport_only,
                     factorized_landmark_only,
-                    budgeted_factorized_landmark_only])):
+                    budgeted_factorized_landmark_only,
+                    factorized_geometry_only])):
                 raise ValueError(
                     'GRPO lightweight-only modes are mutually exclusive'
                 )
@@ -504,7 +527,8 @@ class RLTrainer(BaseVLNCETrainer):
                          instruction_coverage_only, landmark_transport_only,
                          factorized_landmark_only,
                          budgeted_factorized_landmark_only,
-                         monotonic_factorized_landmark_only]) or
+                         monotonic_factorized_landmark_only,
+                         factorized_geometry_only]) or
                         vln_bert_module.successor is None or
                         self.config.GPU_NUMBERS != 1 or self.enable_amp or
                         self.enable_all_dropouts or self.dropout_in_sampling or
@@ -515,7 +539,8 @@ class RLTrainer(BaseVLNCETrainer):
                 self.trainable_parts = [vln_bert_module.successor]
             elif (factorized_landmark_only or
                     budgeted_factorized_landmark_only or
-                    monotonic_factorized_landmark_only):
+                    monotonic_factorized_landmark_only or
+                    factorized_geometry_only):
                 transport = vln_bert_module.factorized_landmark
                 if transport is None:
                     raise ValueError(
@@ -539,6 +564,10 @@ class RLTrainer(BaseVLNCETrainer):
                         self.config.MODEL.instruction_coverage_hidden_size != 0 or
                         self.config.MODEL.landmark_transport_size != 0 or
                         self.config.MODEL.factorized_landmark_size != 128 or
+                        (factorized_geometry_only and
+                         self.config.MODEL.transient_geometry_size != 128) or
+                        (not factorized_geometry_only and
+                         self.config.MODEL.transient_geometry_size != 0) or
                         bool(getattr(
                             self.config.MODEL,
                             'factorized_landmark_budgeted', False
@@ -556,7 +585,9 @@ class RLTrainer(BaseVLNCETrainer):
                         self.config.GRPO.waypoint_aug or
                         self.config.GRPO.back_algo != 'control' or
                         self.config.GRPO.is_requeue):
-                    experiment = ('E17'
+                    experiment = ('E19'
+                                  if factorized_geometry_only else
+                                  'E17'
                                   if monotonic_factorized_landmark_only else
                                   'E16' if budgeted_factorized_landmark_only
                                   else 'E15')
@@ -566,6 +597,13 @@ class RLTrainer(BaseVLNCETrainer):
                         'single-GPU dropout-free control training'
                     )
                 self.trainable_parts = [transport]
+                if factorized_geometry_only:
+                    geometry = vln_bert_module.transient_geometry
+                    if geometry is None:
+                        raise ValueError(
+                            'E19 requires MODEL.transient_geometry_size > 0'
+                        )
+                    self.trainable_parts.append(geometry)
             elif landmark_transport_only:
                 transport = vln_bert_module.landmark_transport
                 if transport is None:
@@ -806,17 +844,31 @@ class RLTrainer(BaseVLNCETrainer):
                 )
         if (self.factorized_landmark_only or
                 self.budgeted_factorized_landmark_only or
-                self.monotonic_factorized_landmark_only):
+                self.monotonic_factorized_landmark_only or
+                self.factorized_geometry_only):
             trainable_count = sum(p.numel() for _, p in trainable_parameters)
             invalid_names = [
                 name for name, _ in trainable_parameters
-                if '.factorized_landmark.' not in name
+                if ('.factorized_landmark.' not in name and
+                    (not self.factorized_geometry_only or
+                     '.transient_geometry.' not in name))
             ]
-            if invalid_names or trainable_count != 590848:
-                experiment = ('E17'
+            expected_count = (
+                706944 if self.factorized_geometry_only else 590848
+            )
+            if invalid_names or trainable_count != expected_count:
+                experiment = ('E19'
+                              if self.factorized_geometry_only else
+                              'E17'
                               if self.monotonic_factorized_landmark_only else
                               'E16' if self.budgeted_factorized_landmark_only
                               else 'E15')
+                if self.factorized_geometry_only:
+                    raise RuntimeError(
+                        'E19 expected exactly 706,944 semantic-geometry '
+                        'parameters, got invalid=%s and %d parameters' %
+                        (invalid_names, trainable_count)
+                    )
                 raise RuntimeError(
                     experiment + ' expected exactly 590,848 factorized-landmark '
                     'parameters, got invalid=%s and %d parameters' %
@@ -1042,18 +1094,26 @@ class RLTrainer(BaseVLNCETrainer):
 
             if (self.factorized_landmark_only or
                     self.budgeted_factorized_landmark_only or
-                    self.monotonic_factorized_landmark_only):
+                    self.monotonic_factorized_landmark_only or
+                    self.factorized_geometry_only):
                 expected_missing = {
                     'net.vln_bert.factorized_landmark.' + name
                     for name in vln_bert_module.factorized_landmark.state_dict()
                 }
+                if self.factorized_geometry_only:
+                    expected_missing.update({
+                        'net.vln_bert.transient_geometry.' + name
+                        for name in vln_bert_module.transient_geometry.state_dict()
+                    })
                 actual_missing = {
                     key.replace('net.module.', 'net.')
                     for key in incompatible_keys.missing_keys
                 }
                 if (actual_missing != expected_missing or
                         incompatible_keys.unexpected_keys):
-                    experiment = ('E17'
+                    experiment = ('E19'
+                                  if self.factorized_geometry_only else
+                                  'E17'
                                   if self.monotonic_factorized_landmark_only else
                                   'E16' if self.budgeted_factorized_landmark_only
                                   else 'E15')
@@ -1062,6 +1122,8 @@ class RLTrainer(BaseVLNCETrainer):
                         'landmark weights'
                     )
                 vln_bert_module.factorized_landmark.reset_output()
+                if self.factorized_geometry_only:
+                    vln_bert_module.transient_geometry.reset_output()
 
             if getattr(self.config.GRPO, 'gauss_only', False):
                 invalid_missing = [
@@ -1710,7 +1772,8 @@ class RLTrainer(BaseVLNCETrainer):
         if (self.landmark_transport_only or
                 self.factorized_landmark_only or
                 self.budgeted_factorized_landmark_only or
-                self.monotonic_factorized_landmark_only):
+                self.monotonic_factorized_landmark_only or
+                self.factorized_geometry_only):
             transport_count = sum(
                 sample['transport_count'] for sample in self.data_buffer
             )
@@ -1722,7 +1785,8 @@ class RLTrainer(BaseVLNCETrainer):
             ) / max(transport_count, 1))
             if (self.factorized_landmark_only or
                     self.budgeted_factorized_landmark_only or
-                    self.monotonic_factorized_landmark_only):
+                    self.monotonic_factorized_landmark_only or
+                    self.factorized_geometry_only):
                 self.logs['conditional_frontier_kl'].append(sum(
                     sample['conditional_frontier_kl_sum']
                     for sample in self.data_buffer
@@ -1745,6 +1809,15 @@ class RLTrainer(BaseVLNCETrainer):
                     self.logs[log_name].append(sum(
                         sample[sample_name] for sample in self.data_buffer
                     ) / max(transport_count, 1))
+            if self.factorized_geometry_only:
+                self.logs['geometry_coverage'].append(sum(
+                    sample['geometry_coverage_sum']
+                    for sample in self.data_buffer
+                ) / max(transport_count, 1))
+                self.logs['geometry_residual_norm'].append(sum(
+                    sample['geometry_residual_sum']
+                    for sample in self.data_buffer
+                ) / max(transport_count, 1))
             if self.monotonic_factorized_landmark_only:
                 for log_name, sample_name in [
                         ('instruction_stage_expected',
@@ -2023,6 +2096,7 @@ class RLTrainer(BaseVLNCETrainer):
                         trainable_params, self.max_grad_norm,
                         error_if_nonfinite=(
                             self.monotonic_factorized_landmark_only or
+                            self.factorized_geometry_only or
                             self.route_attention_only
                         ),
                     )
@@ -2064,6 +2138,8 @@ class RLTrainer(BaseVLNCETrainer):
                 self.e16_optimizer_updates += 1
             if self.monotonic_factorized_landmark_only:
                 self.e17_optimizer_updates += 1
+            if self.factorized_geometry_only:
+                self.e19_optimizer_updates += 1
             self.logs['policy_loss'].append(total_policy_loss_across_epochs / actual_epochs_processed)
             if self.need_ref_policy:
                 self.logs['kl_loss'].append(total_kl_loss_across_epochs / actual_epochs_processed)
@@ -2507,6 +2583,8 @@ class RLTrainer(BaseVLNCETrainer):
             "instruction_stage_expected_sum": 0.0,
             "instruction_stage_entropy_sum": 0.0,
             "instruction_stage_advance_sum": 0.0,
+            "geometry_coverage_sum": 0.0,
+            "geometry_residual_sum": 0.0,
             "success": [None] * self.envs.num_envs,
             "oracle_success": [None] * self.envs.num_envs,
             "setwise_outcome": [None] * self.envs.num_envs,
@@ -2649,6 +2727,14 @@ class RLTrainer(BaseVLNCETrainer):
                 )
                 nav_inputs['gmap_geo_tokens'] = geo_tokens
                 nav_inputs['gmap_geo_masks'] = geo_masks
+            if 'cand_local_geometry' in wp_outputs:
+                geometry, geometry_masks = align_candidate_point_sets(
+                    nav_inputs['gmap_vp_ids'], candidate_targets,
+                    wp_outputs['cand_local_geometry'],
+                    wp_outputs['cand_local_geometry_masks'],
+                )
+                nav_inputs['gmap_local_geometry'] = geometry
+                nav_inputs['gmap_local_geometry_masks'] = geometry_masks
             nav_inputs.update({
                 'mode': 'navigation',
             })
@@ -2719,7 +2805,8 @@ class RLTrainer(BaseVLNCETrainer):
             if (self.landmark_transport_only or
                     self.factorized_landmark_only or
                     self.budgeted_factorized_landmark_only or
-                    self.monotonic_factorized_landmark_only):
+                    self.monotonic_factorized_landmark_only or
+                    self.factorized_geometry_only):
                 data_this_sample['transport_entropy_sum'] += (
                     nav_outs['transport_entropy'].item()
                 )
@@ -2729,7 +2816,8 @@ class RLTrainer(BaseVLNCETrainer):
                 data_this_sample['transport_count'] += 1
             if (self.factorized_landmark_only or
                     self.budgeted_factorized_landmark_only or
-                    self.monotonic_factorized_landmark_only):
+                    self.monotonic_factorized_landmark_only or
+                    self.factorized_geometry_only):
                 data_this_sample['conditional_frontier_kl_sum'] += (
                     nav_outs['conditional_frontier_kl'].item()
                 )
@@ -2753,6 +2841,13 @@ class RLTrainer(BaseVLNCETrainer):
                     data_this_sample[sample_name] += nav_outs[
                         output_name
                     ].item()
+            if self.factorized_geometry_only:
+                data_this_sample['geometry_coverage_sum'] += nav_outs[
+                    'geometry_coverage'
+                ].item()
+                data_this_sample['geometry_residual_sum'] += nav_outs[
+                    'geometry_residual_norm'
+                ].item()
             if self.monotonic_factorized_landmark_only:
                 for sample_name, output_name in [
                         ('instruction_stage_expected_sum',
@@ -2809,7 +2904,8 @@ class RLTrainer(BaseVLNCETrainer):
             # determine action
             if (self.factorized_landmark_only or
                     self.budgeted_factorized_landmark_only or
-                    self.monotonic_factorized_landmark_only):
+                    self.monotonic_factorized_landmark_only or
+                    self.factorized_geometry_only):
                 c = torch.distributions.Categorical(nav_probs)
                 a_t = c.sample().detach()
             elif hindsight_stop_only or terminal_commit_only or use_base_policy:

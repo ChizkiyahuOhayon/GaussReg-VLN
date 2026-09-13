@@ -43,6 +43,7 @@ from .utils import (
 )
 from vlnce_baselines.common.utils import dis_to_con, gather_list_and_concat
 from vlnce_baselines.geo_token import align_candidate_tokens
+from vlnce_baselines.transient_local_geometry import align_candidate_point_sets
 from vlnce_baselines.instruction_coverage import (
     NUM_INSTRUCTION_SLOTS,
     aggregate_view_evidence,
@@ -1108,6 +1109,14 @@ class RLTrainer(BaseVLNCETrainer):
                 )
                 nav_inputs['gmap_geo_tokens'] = geo_tokens
                 nav_inputs['gmap_geo_masks'] = geo_masks
+            if 'cand_local_geometry' in wp_outputs:
+                geometry, geometry_masks = align_candidate_point_sets(
+                    nav_inputs['gmap_vp_ids'], candidate_targets,
+                    wp_outputs['cand_local_geometry'],
+                    wp_outputs['cand_local_geometry_masks'],
+                )
+                nav_inputs['gmap_local_geometry'] = geometry
+                nav_inputs['gmap_local_geometry_masks'] = geometry_masks
             nav_inputs.update({
                 'mode': 'navigation',
                 'txt_embeds': txt_embeds, 
